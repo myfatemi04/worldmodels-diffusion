@@ -260,6 +260,7 @@ class VJEPA2JointDiffuserRopeAttention(nn.Module):
         )
 
         self.proj = nn.Linear(hidden_size, hidden_size)
+        self.proj_action = nn.Linear(hidden_size, hidden_size)
         self.dropout_prob = config.attention_probs_dropout_prob
         self.dropout = nn.Dropout(self.dropout_prob)
 
@@ -332,7 +333,10 @@ class VJEPA2JointDiffuserRopeAttention(nn.Module):
         position_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
         head_mask: Optional[torch.Tensor] = None,
-    ) -> Union[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor]]:
+    ) -> Union[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor],
+    ]:
         batch_size, _, _ = video_hidden_states.shape
 
         def get_proj(layer, states):
@@ -345,15 +349,21 @@ class VJEPA2JointDiffuserRopeAttention(nn.Module):
             )
 
         # video qkv
-        query_layer = get_proj(self.query, video_hidden_states)
-        key_layer = get_proj(self.key, video_hidden_states)
-        value_layer = get_proj(self.value, video_hidden_states)
+        query_layer_video = get_proj(self.query, video_hidden_states)
+        key_layer_video = get_proj(self.key, video_hidden_states)
+        value_layer_video = get_proj(self.value, video_hidden_states)
 
         pos_ids = self.get_video_position_ids(video_hidden_states, masks=position_mask)
-        key_layer = self.apply_rotary_embeddings(key_layer, pos_ids)
-        query_layer = self.apply_rotary_embeddings(query_layer, pos_ids)
+        key_layer_video = self.apply_rotary_embeddings(key_layer_video, pos_ids)
+        query_layer_video = self.apply_rotary_embeddings(query_layer_video, pos_ids)
 
-        # action qkv
+        """
+        action qkv.
+        assumptions:
+        - first action = first video frame, last action = last video frame
+        - actions evenly-spaced
+        - (num_actions - 1) / num_video_frames = k, integer, "subsampling amount"
+        """
         query_layer_action = get_proj(self.query_action, action_hidden_states)
         key_layer_action = get_proj(self.key_action, action_hidden_states)
         value_layer_action = get_proj(self.value_action, action_hidden_states)
@@ -367,6 +377,10 @@ class VJEPA2JointDiffuserRopeAttention(nn.Module):
         query_layer_action = self.apply_rotary_embeddings(
             query_layer_action, (d_mask_actions, d_mask_actions, d_mask_actions)
         )
+
+        query_layer = torch.cat((query_layer_video, query_layer_action), dim=1)
+        key_layer = torch.cat((key_layer_video, key_layer_action), dim=1)
+        value_layer = torch.cat((value_layer_video, value_layer_action), dim=1)
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -392,10 +406,19 @@ class VJEPA2JointDiffuserRopeAttention(nn.Module):
         )
 
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
-        context_layer = self.proj(context_layer.reshape(new_context_layer_shape))
+        context_layer = context_layer.reshape(new_context_layer_shape)
+        context_layer_video, context_layer_action = torch.split(
+            context_layer,
+            [query_layer_video.shape[1], query_layer_action.shape[1]],
+            dim=1,
+        )
+        context_layer_video = self.proj(context_layer_video)
+        context_layer_action = self.proj_action(context_layer_action)
 
         outputs = (
-            (context_layer, attention_probs) if output_attentions else (context_layer,)
+            (context_layer_video, context_layer_action, attention_probs)
+            if output_attentions
+            else (context_layer, context_layer_action)
         )
 
         return outputs
@@ -493,9 +516,9 @@ class VJEPA2Layer(GradientCheckpointingLayer):
     def forward(
         self,
         video_hidden_states: torch.Tensor,
-        video_t: torch.Tensor,
         action_hidden_states: torch.Tensor,
-        action_t: torch.Tensor,
+        video_mod: torch.Tensor,
+        action_mod: torch.Tensor,
         position_mask: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
@@ -505,6 +528,9 @@ class VJEPA2Layer(GradientCheckpointingLayer):
         video_hidden_states = self.norm1(video_hidden_states)
         self_attention_outputs = self.attention(
             video_hidden_states,
+            action_hidden_states,
+            video_mod,
+            action_mod,
             position_mask=position_mask,  # position mask for context/target selection
             head_mask=head_mask,  # head mask is applied at F.scaled_dot_product_attention
             output_attentions=output_attentions,
