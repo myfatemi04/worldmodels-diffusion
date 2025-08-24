@@ -14,7 +14,7 @@ When using a batch size of 1,
 
 mps:
     forward pass:
-        8 frames (1024 tokens): 1.2s
+        8 frames (1024 tokens): 1.2s -> 0.87s without predictor
         16 frames (2048 tokens): 3.1s
     forward + backward + optimizer step:
         8 frames (1024 tokens):
@@ -42,7 +42,7 @@ mps:
 
 T4 GPU:
     forward pass:
-        8 frames (1024 tokens): 0.3s
+        8 frames (1024 tokens): 0.3s -> faster without predictor?
         16 frames (2048 tokens): 0.73s
     forward + backward + optimizer step:
         8 frames (1024 tokens): 0.89s
@@ -57,6 +57,9 @@ T4 GPU:
         8 frames (1024 tokens): 3.075s
 
 torch.compile didn't work on Colab or locally, so not testing for now.
+
+oh wait, also, V-JEPA2 uses the "predictor" by default, which is a second forward pass.
+
 """
 
 import time
@@ -87,7 +90,7 @@ def main():
     do_backward_pass = True
     batch_size = 1
 
-    model = torch.compile(model)
+    # model = torch.compile(model)
 
     for num_frames in [8, 16]:
         # encoded = processor(video, return_tensors="pt")
@@ -105,7 +108,8 @@ def main():
                     output = model(
                         pixel_values_videos=torch.randn_like(
                             encoded["pixel_values_videos"], device=device
-                        )
+                        ),
+                        skip_predictor=True,
                     )
                     t1 = time.time()
 
@@ -123,7 +127,8 @@ def main():
                 output = model(
                     pixel_values_videos=torch.randn_like(
                         encoded["pixel_values_videos"], device=device
-                    )
+                    ),
+                    skip_predictor=True,
                 )
                 labels = torch.randn(
                     (encoded["pixel_values_videos"].shape[0], 128 * num_frames, 1024),
