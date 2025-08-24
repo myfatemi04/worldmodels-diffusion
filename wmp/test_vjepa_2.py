@@ -56,15 +56,7 @@ T4 GPU:
     forward + backward + optimizer step:
         8 frames (1024 tokens): 3.075s
 
-When using a batch size of 1 and torch.compile, we get:
-
-T4 GPU:
-    forward pass:
-        8 frames (1024 tokens):
-    forward + backward + optimizer step:
-        8 frames (1024 tokens):
-
-
+torch.compile didn't work on Colab or locally, so not testing for now.
 """
 
 import time
@@ -82,81 +74,71 @@ def load_video(path):
 
 
 def main():
+    device = "cpu"
     ckpt = "facebook/vjepa2-vitl-fpc64-256"
-    model = VJEPA2Model.from_pretrained(ckpt)
+    model = VJEPA2Model.from_pretrained(ckpt).to(device)
     processor = cast(VJEPA2VideoProcessor, VJEPA2VideoProcessor.from_pretrained(ckpt))
 
     # load a video, 16x256x256x3 float32
     original_video = load_video("./data/pusht_noise/train/obses/episode_000.mp4")
 
     num_frames = [8, 16]
-    do_forward_pass = False
+    do_forward_pass = True
     do_backward_pass = True
+    batch_size = 1
+
+    model = torch.compile(model)
 
     for num_frames in [8, 16]:
-        video = original_video[:num_frames]
-        encoded = processor(video, return_tensors="pt")
-
-        # skipping because of the following:
-        # torch._inductor.exc.InductorError: ImportError: dlopen(/var/folders/pt/45xmzdh176jcsmxv9vb4by_c0000gn/T/torchinductor_michaelfatemi/kx/ckxhkaj6ldrff7qilnpkdfvtezlhokilim5t76qkkjafvjnhabbk.main.so, 0x0002): Library not loaded: @rpath/libc++.1.dylib
-        # model = torch.compile(model)
+        # encoded = processor(video, return_tensors="pt")
+        encoded = {
+            "pixel_values_videos": torch.randn(
+                (batch_size, num_frames, 3, 256, 256), device=device
+            )
+        }
 
         # test speed for forward pass
         if do_forward_pass:
             with torch.no_grad():
-                # pass a dummy batch through it to load things up
-                t0 = time.time()
-                output = model(
-                    pixel_values_videos=torch.randn_like(encoded["pixel_values_videos"])
-                )
-                t1 = time.time()
-
-                print(f"First forward pass in {t1 - t0:.3f}s")
-
-                # let's try encoding a video. use random batches every time to avoid caching issues.
-                for _ in range(10):
+                for i in range(11):
                     t0 = time.time()
                     output = model(
                         pixel_values_videos=torch.randn_like(
-                            encoded["pixel_values_videos"]
+                            encoded["pixel_values_videos"], device=device
                         )
                     )
                     t1 = time.time()
 
-                    print(f"Forward pass in {t1 - t0:.3f}s")
+                    if i == 0:
+                        print(f"First forward pass in {t1 - t0:.3f}s")
+                    else:
+                        print(f"Forward pass in {t1 - t0:.3f}s")
 
         if do_backward_pass:
             # test speed for forward+backward pass
             optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
-            # pass a dummy batch through it to load things up
-            t0 = time.time()
-            output = model(
-                pixel_values_videos=torch.randn_like(encoded["pixel_values_videos"])
-            )
-            labels = torch.randn((1, 128 * len(video), 1024))
-            loss = F.mse_loss(output.last_hidden_state, labels)
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
-            t1 = time.time()
-
-            print(f"First forward+backward+optimizer step in {t1 - t0:.3f}s")
-
-            # let's try encoding a video. use random batches every time to avoid caching issues.
-            for _ in range(10):
+            for i in range(11):
                 t0 = time.time()
                 output = model(
-                    pixel_values_videos=torch.randn_like(encoded["pixel_values_videos"])
+                    pixel_values_videos=torch.randn_like(
+                        encoded["pixel_values_videos"], device=device
+                    )
                 )
-                labels = torch.randn((1, 128 * len(video), 1024))
+                labels = torch.randn(
+                    (encoded["pixel_values_videos"].shape[0], 128 * num_frames, 1024),
+                    device=device,
+                )
                 loss = F.mse_loss(output.last_hidden_state, labels)
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
                 t1 = time.time()
 
-                print(f"Forward forward+backward+optimizer step in {t1 - t0:.3f}s")
+                if i == 0:
+                    print(f"First forward+backward+optimizer step in {t1 - t0:.3f}s")
+                else:
+                    print(f"Forward forward+backward+optimizer step in {t1 - t0:.3f}s")
 
 
 if __name__ == "__main__":
