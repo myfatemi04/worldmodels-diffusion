@@ -149,6 +149,20 @@ class VJEPA2Embeddings(nn.Module):
         return embeddings
 
 
+class ActionEmbeddings(nn.Module):
+    def __init__(self, action_dim: int, embed_dim: int = 1024):
+        self.embed = nn.Sequential(
+            nn.Linear(action_dim, embed_dim // 2),
+            nn.Mish(),
+            nn.Linear(embed_dim // 2, embed_dim),
+        )
+        self.unembed = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.Mish(),
+            nn.Linear(embed_dim // 2, action_dim),
+        )
+
+
 # Adapted from transformers.models.vit.modeling_vit.eager_attention_forward
 def eager_attention_forward(
     module: nn.Module,
@@ -211,7 +225,7 @@ def rotate_queries_or_keys(x, pos):
     return (x * emb_cos) + (y * emb_sin)
 
 
-class VJEPA2RopeAttention(nn.Module):
+class VJEPA2JointDiffuserRopeAttention(nn.Module):
     def __init__(
         self,
         config: VJEPA2Config,
@@ -234,6 +248,16 @@ class VJEPA2RopeAttention(nn.Module):
         self.query = nn.Linear(hidden_size, self.all_head_size, bias=config.qkv_bias)
         self.key = nn.Linear(hidden_size, self.all_head_size, bias=config.qkv_bias)
         self.value = nn.Linear(hidden_size, self.all_head_size, bias=config.qkv_bias)
+
+        self.query_action = nn.Linear(
+            hidden_size, self.all_head_size, bias=config.qkv_bias
+        )
+        self.key_action = nn.Linear(
+            hidden_size, self.all_head_size, bias=config.qkv_bias
+        )
+        self.value_action = nn.Linear(
+            hidden_size, self.all_head_size, bias=config.qkv_bias
+        )
 
         self.proj = nn.Linear(hidden_size, hidden_size)
         self.dropout_prob = config.attention_probs_dropout_prob
@@ -262,7 +286,7 @@ class VJEPA2RopeAttention(nn.Module):
         tokens_per_row = self.grid_size
         return ids // tokens_per_row
 
-    def get_position_ids(self, x, masks=None):
+    def get_video_position_ids(self, x, masks=None):
         device = x.device
         token_size = x.size(1)
 
@@ -283,6 +307,7 @@ class VJEPA2RopeAttention(nn.Module):
         width_ids = (ids - tokens_per_frame * frame_ids) - tokens_per_row * height_ids
         return frame_ids, height_ids, width_ids
 
+    # to do 1d rotary embeddings, use the d_mask == h_mask == w_mask
     def apply_rotary_embeddings(self, qk, pos_ids):
         d_mask, h_mask, w_mask = pos_ids
         s = 0
@@ -302,31 +327,46 @@ class VJEPA2RopeAttention(nn.Module):
 
     def forward(
         self,
-        hidden_states,
+        video_hidden_states,
+        action_hidden_states,
         position_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
         head_mask: Optional[torch.Tensor] = None,
     ) -> Union[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor]]:
-        batch_size, seq_length, _ = hidden_states.shape
-        query_layer = (
-            self.query(hidden_states)
-            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
-            .transpose(1, 2)
-        )
-        key_layer = (
-            self.key(hidden_states)
-            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
-            .transpose(1, 2)
-        )
-        value_layer = (
-            self.value(hidden_states)
-            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
-            .transpose(1, 2)
-        )
+        batch_size, _, _ = video_hidden_states.shape
 
-        pos_ids = self.get_position_ids(hidden_states, masks=position_mask)
+        def get_proj(layer, states):
+            return (
+                layer(states)
+                .view(
+                    batch_size, -1, self.num_attention_heads, self.attention_head_size
+                )
+                .transpose(1, 2)
+            )
+
+        # video qkv
+        query_layer = get_proj(self.query, video_hidden_states)
+        key_layer = get_proj(self.key, video_hidden_states)
+        value_layer = get_proj(self.value, video_hidden_states)
+
+        pos_ids = self.get_video_position_ids(video_hidden_states, masks=position_mask)
         key_layer = self.apply_rotary_embeddings(key_layer, pos_ids)
         query_layer = self.apply_rotary_embeddings(query_layer, pos_ids)
+
+        # action qkv
+        query_layer_action = get_proj(self.query_action, action_hidden_states)
+        key_layer_action = get_proj(self.key_action, action_hidden_states)
+        value_layer_action = get_proj(self.value_action, action_hidden_states)
+        d_mask = pos_ids[0]
+        d_mask_actions = torch.linspace(
+            d_mask[0], d_mask[1], action_hidden_states.shape[1]
+        )
+        key_layer_action = self.apply_rotary_embeddings(
+            key_layer_action, (d_mask_actions, d_mask_actions, d_mask_actions)
+        )
+        query_layer_action = self.apply_rotary_embeddings(
+            query_layer_action, (d_mask_actions, d_mask_actions, d_mask_actions)
+        )
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -439,7 +479,9 @@ class VJEPA2Layer(GradientCheckpointingLayer):
         self.mlp_ratio = mlp_ratio
 
         self.norm1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_eps)
-        self.attention = VJEPA2RopeAttention(config, hidden_size, num_attention_heads)
+        self.attention = VJEPA2JointDiffuserRopeAttention(
+            config, hidden_size, num_attention_heads
+        )
         self.drop_path = (
             VJEPA2DropPath(drop_path_rate)
             if config.drop_path_rate > 0.0
@@ -450,42 +492,48 @@ class VJEPA2Layer(GradientCheckpointingLayer):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        video_hidden_states: torch.Tensor,
+        video_t: torch.Tensor,
+        action_hidden_states: torch.Tensor,
+        action_t: torch.Tensor,
         position_mask: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
     ) -> tuple[torch.Tensor, ...]:
         # Self-Attention
-        residual = hidden_states
-        hidden_states = self.norm1(hidden_states)
+        residual = video_hidden_states
+        video_hidden_states = self.norm1(video_hidden_states)
         self_attention_outputs = self.attention(
-            hidden_states,
+            video_hidden_states,
             position_mask=position_mask,  # position mask for context/target selection
             head_mask=head_mask,  # head mask is applied at F.scaled_dot_product_attention
             output_attentions=output_attentions,
         )
         attention_output = self_attention_outputs[0]
-        hidden_states = self.drop_path(attention_output) + residual
+        video_hidden_states = self.drop_path(attention_output) + residual
 
         # MLP
-        residual = hidden_states
-        hidden_states = self.norm2(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = self.drop_path(hidden_states) + residual
+        residual = video_hidden_states
+        video_hidden_states = self.norm2(video_hidden_states)
+        video_hidden_states = self.mlp(video_hidden_states)
+        video_hidden_states = self.drop_path(video_hidden_states) + residual
 
         # Add self attentions if we output attention weights
         outputs = self_attention_outputs[1:]
-        outputs = (hidden_states,) + outputs
+        outputs = (video_hidden_states,) + outputs
 
         return outputs
 
 
-class VJEPA2Encoder(nn.Module):
-    def __init__(self, config: VJEPA2Config):
+class VJEPA2JointDiffuser(nn.Module):
+    def __init__(self, config: VJEPA2Config, action_dim=2):
         super().__init__()
         self.config = config
 
         self.embeddings = VJEPA2Embeddings(config, hidden_size=config.hidden_size)
+        self.action_embeddings = ActionEmbeddings(
+            action_dim=action_dim, embed_dim=config.hidden_size
+        )
         drop_path_rates = [
             (
                 config.drop_path_rate * i / (config.num_hidden_layers - 1)
@@ -513,6 +561,9 @@ class VJEPA2Encoder(nn.Module):
     def forward(
         self,
         pixel_values_videos: Optional[torch.Tensor] = None,
+        video_t: Optional[torch.Tensor] = None,
+        actions: Optional[torch.Tensor] = None,
+        actions_t: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
@@ -521,28 +572,29 @@ class VJEPA2Encoder(nn.Module):
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
 
-        hidden_states = self.embeddings(pixel_values_videos)
+        video_hidden_states = self.embeddings(pixel_values_videos)
+        action_hidden_states = self.action_embeddings.embed(actions)
 
         for i, layer_module in enumerate(self.layer):
             if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
+                all_hidden_states = all_hidden_states + (video_hidden_states,)
 
             layer_head_mask = head_mask[i] if head_mask is not None else None
             layer_outputs = layer_module(
-                hidden_states, None, layer_head_mask, output_attentions
+                video_hidden_states, None, layer_head_mask, output_attentions
             )
-            hidden_states = layer_outputs[0]
+            video_hidden_states = layer_outputs[0]
 
             if output_attentions:
                 all_self_attentions = all_self_attentions + (layer_outputs[1],)
 
-        hidden_states = self.layernorm(hidden_states)
+        video_hidden_states = self.layernorm(video_hidden_states)
 
         if output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_states,)
+            all_hidden_states = all_hidden_states + (video_hidden_states,)
 
         return BaseModelOutput(
-            last_hidden_state=hidden_states,
+            last_hidden_state=video_hidden_states,
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
         )
