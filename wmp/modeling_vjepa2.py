@@ -157,6 +157,7 @@ class VJEPA2JointDiffuserRopeAttention(nn.Module):
         position_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
         head_mask: Optional[torch.Tensor] = None,
+        final_observation_frame_index: int = 1,
     ) -> Union[
         tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         tuple[torch.Tensor, torch.Tensor],
@@ -181,22 +182,33 @@ class VJEPA2JointDiffuserRopeAttention(nn.Module):
         key_layer_video = self.apply_rotary_embeddings(key_layer_video, pos_ids)
         query_layer_video = self.apply_rotary_embeddings(query_layer_video, pos_ids)
 
-        """
-        action qkv.
-        assumptions:
-        - first action = first video frame, last action = last video frame
-        - actions evenly-spaced
-        - (num_actions - 1) / (num_video_frames - 1) = k, the "subsampling amount"
-        - last action corresponds to last frame, but no actions predicted beyond that,
-          so the last frame uniquely has only 1 action associated to it.
-        """
         query_layer_action = get_proj(self.query_action, action_hidden_states)
         key_layer_action = get_proj(self.key_action, action_hidden_states)
         value_layer_action = get_proj(self.value_action, action_hidden_states)
+
+        """
+        Action positional embeddings. Might look confusing, but here is how it works.
+
+        Video Frame Index  .  [0       1]     [2       3]     [4       5]     [6       7]
+        Action Index       .           0   1   2   3   4   5   6   7   8   9  10  11  12
+
+        V-JEPA2 encodes groups of frames, denoted by the square brackets ('[' and ']').
+        Let's say we have an observation history of length 2. Then for each frame, we predict
+        2 actions until we hit the next frame.
+        """
         d_mask = pos_ids[0]
+        num_actions = action_hidden_states.shape[1]
+        num_frames = (d_mask[-1] + 1) * self.config.tubelet_size
         d_mask_actions = torch.linspace(
-            d_mask[0], d_mask[-1], action_hidden_states.shape[1]
+            final_observation_frame_index / self.config.tubelet_size,
+            (num_frames - 1) / self.config.tubelet_size,
+            num_actions,
         )
+
+        assert (num_actions - 1) % (
+            num_frames - final_observation_frame_index - 1
+        ) == 0, f"(num_actions - 1) % (num_frames - final_observation_frame_index - 1) = {num_actions - 1} % {num_frames - final_observation_frame_index - 1} = {(num_actions - 1) % (num_frames - final_observation_frame_index - 1)} != 0"
+
         key_layer_action = self.apply_rotary_embeddings(
             key_layer_action, (d_mask_actions, d_mask_actions, d_mask_actions)
         )
