@@ -36,6 +36,7 @@ logger = logging.get_logger(__name__)
 
 class ActionEmbeddings(nn.Module):
     def __init__(self, action_dim: int, embed_dim: int = 1024):
+        super().__init__()
         self.embed = nn.Sequential(
             nn.Linear(action_dim, embed_dim // 2),
             nn.Mish(),
@@ -185,14 +186,16 @@ class VJEPA2JointDiffuserRopeAttention(nn.Module):
         assumptions:
         - first action = first video frame, last action = last video frame
         - actions evenly-spaced
-        - (num_actions - 1) / num_video_frames = k, integer, "subsampling amount"
+        - (num_actions - 1) / (num_video_frames - 1) = k, the "subsampling amount"
+        - last action corresponds to last frame, but no actions predicted beyond that,
+          so the last frame uniquely has only 1 action associated to it.
         """
         query_layer_action = get_proj(self.query_action, action_hidden_states)
         key_layer_action = get_proj(self.key_action, action_hidden_states)
         value_layer_action = get_proj(self.value_action, action_hidden_states)
         d_mask = pos_ids[0]
         d_mask_actions = torch.linspace(
-            d_mask[0], d_mask[1], action_hidden_states.shape[1]
+            d_mask[0], d_mask[-1], action_hidden_states.shape[1]
         )
         key_layer_action = self.apply_rotary_embeddings(
             key_layer_action, (d_mask_actions, d_mask_actions, d_mask_actions)
@@ -201,9 +204,10 @@ class VJEPA2JointDiffuserRopeAttention(nn.Module):
             query_layer_action, (d_mask_actions, d_mask_actions, d_mask_actions)
         )
 
-        query_layer = torch.cat((query_layer_video, query_layer_action), dim=1)
-        key_layer = torch.cat((key_layer_video, key_layer_action), dim=1)
-        value_layer = torch.cat((value_layer_video, value_layer_action), dim=1)
+        # shape: (b, n_head, seq_len, d)
+        query_layer = torch.cat((query_layer_video, query_layer_action), dim=-2)
+        key_layer = torch.cat((key_layer_video, key_layer_action), dim=-2)
+        value_layer = torch.cat((value_layer_video, value_layer_action), dim=-2)
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -232,8 +236,8 @@ class VJEPA2JointDiffuserRopeAttention(nn.Module):
         context_layer = context_layer.reshape(new_context_layer_shape)
         context_layer_video, context_layer_action = torch.split(
             context_layer,
-            [query_layer_video.shape[1], query_layer_action.shape[1]],
-            dim=1,
+            [query_layer_video.shape[-2], query_layer_action.shape[-2]],
+            dim=-2,
         )
         context_layer_video = self.proj(context_layer_video)
         context_layer_action = self.proj_action(context_layer_action)
@@ -241,7 +245,7 @@ class VJEPA2JointDiffuserRopeAttention(nn.Module):
         outputs = (
             (context_layer_video, context_layer_action, attention_probs)
             if output_attentions
-            else (context_layer, context_layer_action)
+            else (context_layer_video, context_layer_action)
         )
 
         return outputs
@@ -309,7 +313,7 @@ class VJEPA2JointDiffuserLayer(GradientCheckpointingLayer):
             output_attentions=output_attentions,
         )
         video_attention_output = self_attention_outputs[0]
-        action_attention_output = self_attention_outputs[-1]
+        action_attention_output = self_attention_outputs[1]
         video_hidden_states = (
             self.drop_path(video_attention_output)
             + video_residual * video_residual_scale
@@ -361,7 +365,7 @@ class SinusoidalPosEmbed(nn.Module):
 
 
 class VJEPA2JointDiffuser(nn.Module):
-    def __init__(self, config: VJEPA2Config, action_dim=2):
+    def __init__(self, config: VJEPA2Config, action_dim: int):
         super().__init__()
         self.config = config
 
@@ -396,24 +400,24 @@ class VJEPA2JointDiffuser(nn.Module):
         timestep_embed_dim = 128
         self.video_modulation = nn.Sequential(
             SinusoidalPosEmbed(timestep_embed_dim, 1.0),
-            nn.Linear(timestep_embed_dim, config.hidden_size // 2),
+            nn.Linear(timestep_embed_dim, config.hidden_size),
             nn.Mish(),
-            nn.Linear(config.hidden_size // 2, config.hidden_size),
+            nn.Linear(config.hidden_size, config.hidden_size * 3),
         )
         self.action_modulation = nn.Sequential(
             SinusoidalPosEmbed(timestep_embed_dim, 1.0),
-            nn.Linear(timestep_embed_dim, config.hidden_size // 2),
+            nn.Linear(timestep_embed_dim, config.hidden_size),
             nn.Mish(),
-            nn.Linear(config.hidden_size // 2, config.hidden_size),
+            nn.Linear(config.hidden_size, config.hidden_size * 3),
         )
 
     @can_return_tuple
     def forward(
         self,
-        pixel_values_videos: Optional[torch.Tensor] = None,
-        video_t: Optional[torch.Tensor] = None,
-        actions: Optional[torch.Tensor] = None,
-        actions_t: Optional[torch.Tensor] = None,
+        pixel_values_videos: torch.Tensor,
+        actions: torch.Tensor,
+        video_t: torch.Tensor,
+        actions_t: torch.Tensor,
         head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
