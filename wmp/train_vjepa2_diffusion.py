@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from transformers import VJEPA2Model, VJEPA2VideoProcessor
 
 from wmp.modeling_vjepa2 import VJEPA2JointDiffuser
+from loguru import logger
 
 
 def load_video(path):
@@ -79,7 +80,7 @@ def main():
     sigmas = get_sampling_sigmas(sampling_steps=8, shift=1)
     sigma_probs = logit_normal_distribution(sigmas, mu=0, sigma=1)
 
-    for i in range(1000):
+    for i in range(10000):
         sigma_index = torch.multinomial(sigma_probs, num_samples=1, replacement=False)
         sigma = sigmas[sigma_index]
         alpha = 1 - sigma
@@ -111,7 +112,13 @@ def main():
         writer.add_scalar("loss/actions", action_flow_error.item(), i)
         writer.flush()
 
-        print(f"Step {i}: Loss = {loss.item()}")
+        logger.info(
+            f"Step {i}: Loss =  {video_flow_error.item()} (video) + {action_flow_error.item()} (action) = {loss.item()}"
+        )
+
+        if (i % 100) == 0:
+            # save checkpoint
+            torch.save(model.state_dict(), f"./checkpoints/model_{i}.pth")
 
 
 if __name__ == "__main__":
