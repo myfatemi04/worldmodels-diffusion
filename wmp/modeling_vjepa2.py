@@ -193,7 +193,7 @@ class VJEPA2JointDiffuserRopeAttention(nn.Module):
             num_condition_frames - 1
         ) / self.config.tubelet_size
         action_position_ids_t = (
-            torch.arange(action_hidden_states.shape[1]) * (video_fps / action_fps)
+            torch.arange(action_hidden_states.shape[-2]) * (video_fps / action_fps)
             + final_observation_frame_position_id
         )
         # Use same position IDs for all dimensions. This strategy is used in Qwen2.5-Omni, page 4.
@@ -424,8 +424,9 @@ class VJEPA2JointDiffuser(nn.Module):
             nn.Mish(),
             nn.Linear(config.hidden_size, config.hidden_size * 3),
         )
+        self.flow_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        self.flow_proj_actions = nn.Linear(config.hidden_size, action_dim)
 
-    @can_return_tuple
     def forward(
         self,
         video_latents: torch.Tensor,
@@ -436,13 +437,7 @@ class VJEPA2JointDiffuser(nn.Module):
         action_fps: float,
         num_condition_frames: int,
         head_mask: Optional[torch.Tensor] = None,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
-        **kwargs,
-    ) -> BaseModelOutput:
-        all_hidden_states = () if output_hidden_states else None
-        all_self_attentions = () if output_attentions else None
-
+    ):
         # `video` is noisy latents
         video_hidden_states = video_latents
         video_hidden_states[
@@ -464,15 +459,15 @@ class VJEPA2JointDiffuser(nn.Module):
                 num_condition_frames,
                 None,
                 layer_head_mask,
-                output_attentions,
+                output_attentions=False,
             )
             video_hidden_states = layer_outputs[0]
             action_hidden_states = layer_outputs[1]
 
         video_hidden_states = self.layernorm(video_hidden_states)
+        action_hidden_states = self.layernorm(action_hidden_states)
 
-        return BaseModelOutput(
-            last_hidden_state=video_hidden_states,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attentions,
+        return (
+            self.flow_proj(video_hidden_states),
+            self.flow_proj_actions(action_hidden_states),
         )
