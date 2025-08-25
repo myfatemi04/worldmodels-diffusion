@@ -12,141 +12,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
 import torch
 from torch import nn
-
 from transformers.activations import ACT2FN
 from transformers.modeling_layers import GradientCheckpointingLayer
-from transformers.modeling_outputs import BaseModelOutput, ImageClassifierOutput
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.utils import ModelOutput, auto_docstring, can_return_tuple, logging
+from transformers.modeling_outputs import BaseModelOutput
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.vjepa2.configuration_vjepa2 import VJEPA2Config
-
+from transformers.models.vjepa2.modeling_vjepa2 import (
+    VJEPA2MLP,
+    VJEPA2Embeddings,
+    VJEPA2DropPath,
+    eager_attention_forward,
+    rotate_queries_or_keys,
+)
+from transformers.utils import logging
+from transformers.utils.generic import can_return_tuple
 
 logger = logging.get_logger(__name__)
-
-
-@dataclass
-@auto_docstring(
-    custom_intro="""
-    VJEPA Predictor outputs that also contains the masked encoder outputs
-    """
-)
-class VJEPA2WithMaskedInputPredictorOutput(ModelOutput):
-    r"""
-    masked_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*, returned when `context_mask` is provided which is applied on VJEPA2Encoder outputs):
-        The masked hidden state of the model.
-    target_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*, returned when `target_mask` is provided which is applied on VJEPA2Encoder outputs):
-        The target hidden state of the model.
-    """
-
-    last_hidden_state: torch.FloatTensor
-    masked_hidden_state: Optional[torch.FloatTensor] = None
-    hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
-    attentions: Optional[tuple[torch.FloatTensor, ...]] = None
-    target_hidden_state: Optional[torch.FloatTensor] = None
-
-
-@dataclass
-@auto_docstring(
-    custom_intro="""
-    VJEPA outputs that also contains the masked encoder outputs
-    Optionally contains the predictor outputs
-    """
-)
-class VJEPA2WithMaskedInputModelOutput(ModelOutput):
-    r"""
-    masked_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*, returned when `context_mask` is provided which is applied on VJEPA2Encoder outputs):
-        The masked hidden state of the model.
-    predictor_output (`VJEPA2WithMaskedInputPredictorOutput`, *optional*):
-        The output from the Predictor module.
-    """
-
-    last_hidden_state: torch.FloatTensor
-    masked_hidden_state: Optional[torch.FloatTensor] = None
-    hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
-    attentions: Optional[tuple[torch.FloatTensor, ...]] = None
-    predictor_output: Optional[VJEPA2WithMaskedInputPredictorOutput] = None
-
-    def to_tuple(self):
-        output = list(super().to_tuple())
-        if isinstance(output[-1], VJEPA2WithMaskedInputPredictorOutput):
-            output[-1] = output[-1].to_tuple()
-        return tuple(output)
-
-
-class VJEPA2PatchEmbeddings3D(nn.Module):
-    """
-    Image to Patch Embedding
-    """
-
-    def __init__(
-        self,
-        config: VJEPA2Config,
-        hidden_size: int = 1024,
-    ):
-        super().__init__()
-        self.patch_size = config.patch_size
-        self.tubelet_size = config.tubelet_size
-        self.hidden_size = hidden_size
-
-        self.proj = nn.Conv3d(
-            in_channels=config.in_chans,
-            out_channels=hidden_size,
-            kernel_size=(config.tubelet_size, config.patch_size, config.patch_size),
-            stride=(config.tubelet_size, config.patch_size, config.patch_size),
-        )
-
-    @staticmethod
-    def num_patches(config):
-        return (
-            (config.frames_per_clip // config.tubelet_size)
-            * (config.crop_size // config.patch_size)
-            * (config.crop_size // config.patch_size)
-        )
-
-    def forward(self, pixel_values_videos: torch.Tensor) -> torch.Tensor:
-        x = self.proj(pixel_values_videos).flatten(2).transpose(1, 2)
-        return x
-
-
-class VJEPA2Embeddings(nn.Module):
-    """
-    Construct mask token, position and patch embeddings.
-    """
-
-    def __init__(self, config: VJEPA2Config, hidden_size: int = 1024):
-        super().__init__()
-
-        self.config = config
-        self.hidden_size = hidden_size
-        self.patch_embeddings = VJEPA2PatchEmbeddings3D(config, hidden_size=hidden_size)
-
-        self.num_patches = self.patch_embeddings.num_patches
-        self.patch_size = config.patch_size
-
-    def forward(self, pixel_values_videos: torch.Tensor) -> torch.Tensor:
-        num_frames = pixel_values_videos.shape[1]
-
-        # Swap `frames` and `channels` dims, the result is:
-        # (batch_size, channels, num_frames, height, width)
-        pixel_values_videos = pixel_values_videos.permute(0, 2, 1, 3, 4)
-
-        # For some cases, if the input vision (image/video) consists of num_frames < tubelet_size,
-        # then embedding lookup fails. In these cases, we duplicate the frames.
-        if num_frames < self.config.tubelet_size:
-            pixel_values_videos = pixel_values_videos.repeat(
-                1, 1, self.config.tubelet_size, 1, 1
-            )
-
-        target_dtype = self.patch_embeddings.proj.weight.dtype
-        pixel_values_videos = pixel_values_videos.to(dtype=target_dtype)
-        embeddings = self.patch_embeddings(pixel_values_videos)
-
-        return embeddings
 
 
 class ActionEmbeddings(nn.Module):
@@ -161,68 +46,6 @@ class ActionEmbeddings(nn.Module):
             nn.Mish(),
             nn.Linear(embed_dim // 2, action_dim),
         )
-
-
-# Adapted from transformers.models.vit.modeling_vit.eager_attention_forward
-def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs,
-):
-    # Take the dot product between "query" and "key" to get the raw attention scores.
-    attn_weights = torch.matmul(query, key.transpose(-1, -2)) * scaling
-
-    # Normalize the attention scores to probabilities.
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
-        query.dtype
-    )
-
-    # This is actually dropping out entire tokens to attend to, which might
-    # seem a bit unusual, but is taken from the original Transformer paper.
-    attn_weights = nn.functional.dropout(
-        attn_weights, p=dropout, training=module.training
-    )
-
-    # Mask heads if we want to
-    if attention_mask is not None:
-        attn_weights = attn_weights * attention_mask
-
-    attn_output = torch.matmul(attn_weights, value)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-
-    return attn_output, attn_weights
-
-
-def rotate_queries_or_keys(x, pos):
-    B, num_heads, N, D = x.size()
-
-    # similar to inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
-    # they are computing this every time. instead HF style is to compute the inv_freq once and store it
-    # -- compute angle for each position
-    omega = torch.arange(D // 2, dtype=x.dtype, device=x.device)
-    omega /= D / 2.0
-    omega = 1.0 / 10000**omega  # (D/2,)
-    freq = pos.unsqueeze(-1) * omega  # (..., N, D/2), outer product
-
-    # -- build rotation matrix and apply
-    emb_sin = freq.sin()  # (..., N, D/2)
-    emb_cos = freq.cos()  # (..., N, D/2)
-
-    emb_sin = emb_sin.squeeze(-1).repeat(1, 1, 1, 2)
-    emb_cos = emb_cos.squeeze(-1).repeat(1, 1, 1, 2)
-
-    # --
-    y = x.unflatten(-1, (-1, 2))
-    y1, y2 = y.unbind(dim=-1)
-
-    y = torch.stack((-y2, y1), dim=-1)
-    y = y.flatten(-2)
-    return (x * emb_cos) + (y * emb_sin)
 
 
 class VJEPA2JointDiffuserRopeAttention(nn.Module):
@@ -385,7 +208,7 @@ class VJEPA2JointDiffuserRopeAttention(nn.Module):
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             if self.config._attn_implementation == "sdpa" and output_attentions:
-                logger.warning_once(
+                logger.warning(
                     "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
                     'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
                 )
@@ -424,67 +247,7 @@ class VJEPA2JointDiffuserRopeAttention(nn.Module):
         return outputs
 
 
-# Adapted from transformers.models.beit.modeling_dinov2.drop_path
-def drop_path(
-    input: torch.Tensor, drop_prob: float = 0.0, training: bool = False
-) -> torch.Tensor:
-    """
-    Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
-
-    Comment by Ross Wightman: This is the same as the DropConnect impl I created for EfficientNet, etc networks,
-    however, the original name is misleading as 'Drop Connect' is a different form of dropout in a separate paper...
-    See discussion: https://github.com/tensorflow/tpu/issues/494#issuecomment-532968956 ... I've opted for changing the
-    layer and argument names to 'drop path' rather than mix DropConnect as a layer name and use 'survival rate' as the
-    argument.
-    """
-    if drop_prob == 0.0 or not training:
-        return input
-    keep_prob = 1 - drop_prob
-    shape = (input.shape[0],) + (1,) * (
-        input.ndim - 1
-    )  # work with diff dim tensors, not just 2D ConvNets
-    random_tensor = keep_prob + torch.rand(
-        shape, dtype=input.dtype, device=input.device
-    )
-    random_tensor.floor_()  # binarize
-    output = input.div(keep_prob) * random_tensor
-    return output
-
-
-# Adapted from transformers.models.beit.modeling_beit.BeitDropPath
-class VJEPA2DropPath(nn.Module):
-    """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks)."""
-
-    def __init__(self, drop_prob: Optional[float] = None):
-        super().__init__()
-        self.drop_prob = drop_prob
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return drop_path(hidden_states, self.drop_prob, self.training)
-
-    def extra_repr(self) -> str:
-        return f"p={self.drop_prob}"
-
-
-class VJEPA2MLP(nn.Module):
-    def __init__(
-        self, config: VJEPA2Config, hidden_size: int = 1024, mlp_ratio: float = 4.0
-    ):
-        super().__init__()
-        in_features = out_features = hidden_size
-        hidden_features = int(hidden_size * mlp_ratio)
-        self.fc1 = nn.Linear(in_features, hidden_features, bias=True)
-        self.activation = ACT2FN[config.hidden_act]
-        self.fc2 = nn.Linear(hidden_features, out_features, bias=True)
-
-    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
-        hidden_state = self.fc1(hidden_state)
-        hidden_state = self.activation(hidden_state)
-        hidden_state = self.fc2(hidden_state)
-        return hidden_state
-
-
-class VJEPA2Layer(GradientCheckpointingLayer):
+class VJEPA2JointDiffuserLayer(GradientCheckpointingLayer):
     """This corresponds to the Block class in the original implementation."""
 
     def __init__(
@@ -512,31 +275,49 @@ class VJEPA2Layer(GradientCheckpointingLayer):
         )
         self.norm2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_eps)
         self.mlp = VJEPA2MLP(config, hidden_size=hidden_size, mlp_ratio=mlp_ratio)
+        self.mlp_actions = VJEPA2MLP(
+            config, hidden_size=hidden_size, mlp_ratio=mlp_ratio
+        )
 
     def forward(
         self,
         video_hidden_states: torch.Tensor,
         action_hidden_states: torch.Tensor,
-        video_mod: torch.Tensor,
-        action_mod: torch.Tensor,
+        video_modulation: torch.Tensor,
+        action_modulation: torch.Tensor,
         position_mask: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
     ) -> tuple[torch.Tensor, ...]:
         # Self-Attention
-        residual = video_hidden_states
+        video_residual = video_hidden_states
+        action_residual = action_hidden_states
         video_hidden_states = self.norm1(video_hidden_states)
+
+        video_shift, video_scale, video_residual_scale = torch.chunk(
+            video_modulation, 3, dim=-1
+        )
+        action_shift, action_scale, action_residual_scale = torch.chunk(
+            action_modulation, 3, dim=-1
+        )
+
         self_attention_outputs = self.attention(
-            video_hidden_states,
-            action_hidden_states,
-            video_mod,
-            action_mod,
+            video_hidden_states * (1 + video_scale) + video_shift,
+            action_hidden_states * (1 + action_scale) + action_shift,
             position_mask=position_mask,  # position mask for context/target selection
             head_mask=head_mask,  # head mask is applied at F.scaled_dot_product_attention
             output_attentions=output_attentions,
         )
-        attention_output = self_attention_outputs[0]
-        video_hidden_states = self.drop_path(attention_output) + residual
+        video_attention_output = self_attention_outputs[0]
+        action_attention_output = self_attention_outputs[-1]
+        video_hidden_states = (
+            self.drop_path(video_attention_output)
+            + video_residual * video_residual_scale
+        )
+        action_hidden_states = (
+            self.drop_path(action_attention_output)
+            + action_residual * action_residual_scale
+        )
 
         # MLP
         residual = video_hidden_states
@@ -544,11 +325,39 @@ class VJEPA2Layer(GradientCheckpointingLayer):
         video_hidden_states = self.mlp(video_hidden_states)
         video_hidden_states = self.drop_path(video_hidden_states) + residual
 
+        residual = action_hidden_states
+        action_hidden_states = self.norm2(action_hidden_states)
+        action_hidden_states = self.mlp_actions(action_hidden_states)
+        action_hidden_states = self.drop_path(action_hidden_states) + residual
+
         # Add self attentions if we output attention weights
-        outputs = self_attention_outputs[1:]
-        outputs = (video_hidden_states,) + outputs
+        outputs = (video_hidden_states, action_hidden_states) + self_attention_outputs[
+            -1:
+        ]
 
         return outputs
+
+
+class SinusoidalPosEmbed(nn.Module):
+    # by Michael
+    def __init__(self, size: int, max_length: float, dtype=torch.float32):
+        super().__init__()
+
+        self.size = size
+        self.max_length = max_length
+        self.dtype = dtype
+
+    def forward(self, position: torch.Tensor):
+        angle = torch.exp(
+            torch.log(position.unsqueeze(-1) / self.max_length)
+            * (torch.arange(0, self.size, 2) / float(self.size))
+        )
+        embed = torch.zeros(
+            (*position.shape, self.size), device=position.device, dtype=self.dtype
+        )
+        embed[:, 0::2] = torch.sin(angle)
+        embed[:, 1::2] = torch.cos(angle)
+        return embed
 
 
 class VJEPA2JointDiffuser(nn.Module):
@@ -570,7 +379,7 @@ class VJEPA2JointDiffuser(nn.Module):
         ]
         self.layer = nn.ModuleList(
             [
-                VJEPA2Layer(
+                VJEPA2JointDiffuserLayer(
                     config,
                     drop_path_rate=drop_path_rates[i],
                     hidden_size=config.hidden_size,
@@ -582,6 +391,21 @@ class VJEPA2JointDiffuser(nn.Module):
         )
         self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.gradient_checkpointing = False
+
+        # flow-matching; timesteps are in [0.0, 1.0]
+        timestep_embed_dim = 128
+        self.video_modulation = nn.Sequential(
+            SinusoidalPosEmbed(timestep_embed_dim, 1.0),
+            nn.Linear(timestep_embed_dim, config.hidden_size // 2),
+            nn.Mish(),
+            nn.Linear(config.hidden_size // 2, config.hidden_size),
+        )
+        self.action_modulation = nn.Sequential(
+            SinusoidalPosEmbed(timestep_embed_dim, 1.0),
+            nn.Linear(timestep_embed_dim, config.hidden_size // 2),
+            nn.Mish(),
+            nn.Linear(config.hidden_size // 2, config.hidden_size),
+        )
 
     @can_return_tuple
     def forward(
@@ -600,24 +424,24 @@ class VJEPA2JointDiffuser(nn.Module):
 
         video_hidden_states = self.embeddings(pixel_values_videos)
         action_hidden_states = self.action_embeddings.embed(actions)
+        video_modulation = self.video_modulation(video_t)
+        action_modulation = self.action_modulation(actions_t)
 
         for i, layer_module in enumerate(self.layer):
-            if output_hidden_states:
-                all_hidden_states = all_hidden_states + (video_hidden_states,)
-
             layer_head_mask = head_mask[i] if head_mask is not None else None
             layer_outputs = layer_module(
-                video_hidden_states, None, layer_head_mask, output_attentions
+                video_hidden_states,
+                action_hidden_states,
+                video_modulation,
+                action_modulation,
+                None,
+                layer_head_mask,
+                output_attentions,
             )
             video_hidden_states = layer_outputs[0]
-
-            if output_attentions:
-                all_self_attentions = all_self_attentions + (layer_outputs[1],)
+            action_hidden_states = layer_outputs[1]
 
         video_hidden_states = self.layernorm(video_hidden_states)
-
-        if output_hidden_states:
-            all_hidden_states = all_hidden_states + (video_hidden_states,)
 
         return BaseModelOutput(
             last_hidden_state=video_hidden_states,
