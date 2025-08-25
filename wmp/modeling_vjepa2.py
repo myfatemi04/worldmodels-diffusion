@@ -154,10 +154,12 @@ class VJEPA2JointDiffuserRopeAttention(nn.Module):
         self,
         video_hidden_states,
         action_hidden_states,
+        num_condition_frames: int,
+        video_fps: float,
+        action_fps: float,
         position_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
         head_mask: Optional[torch.Tensor] = None,
-        final_observation_frame_index: int = 1,
     ) -> Union[
         tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         tuple[torch.Tensor, torch.Tensor],
@@ -182,38 +184,31 @@ class VJEPA2JointDiffuserRopeAttention(nn.Module):
         key_layer_video = self.apply_rotary_embeddings(key_layer_video, pos_ids)
         query_layer_video = self.apply_rotary_embeddings(query_layer_video, pos_ids)
 
+        # action qkv
         query_layer_action = get_proj(self.query_action, action_hidden_states)
         key_layer_action = get_proj(self.key_action, action_hidden_states)
         value_layer_action = get_proj(self.value_action, action_hidden_states)
 
-        """
-        Action positional embeddings. Might look confusing, but here is how it works.
-
-        Video Frame Index  .  [0       1]     [2       3]     [4       5]     [6       7]
-        Action Index       .           0   1   2   3   4   5   6   7   8   9  10  11  12
-
-        V-JEPA2 encodes groups of frames, denoted by the square brackets ('[' and ']').
-        Let's say we have an observation history of length 2. Then for each frame, we predict
-        2 actions until we hit the next frame.
-        """
-        d_mask = pos_ids[0]
-        num_actions = action_hidden_states.shape[1]
-        num_frames = (d_mask[-1] + 1) * self.config.tubelet_size
-        d_mask_actions = torch.linspace(
-            final_observation_frame_index / self.config.tubelet_size,
-            (num_frames - 1) / self.config.tubelet_size,
-            num_actions,
+        final_observation_frame_position_id = (
+            num_condition_frames - 1
+        ) / self.config.tubelet_size
+        action_position_ids_t = (
+            torch.arange(action_hidden_states.shape[1]) * (video_fps / action_fps)
+            + final_observation_frame_position_id
         )
-
-        assert (num_actions - 1) % (
-            num_frames - final_observation_frame_index - 1
-        ) == 0, f"(num_actions - 1) % (num_frames - final_observation_frame_index - 1) = {num_actions - 1} % {num_frames - final_observation_frame_index - 1} = {(num_actions - 1) % (num_frames - final_observation_frame_index - 1)} != 0"
+        # Use same position IDs for all dimensions. This strategy is used in Qwen2.5-Omni, page 4.
+        # "For text inputs, these components utilize identical position IDs, making M-RoPE functionally equivalent to 1D-RoPE"
+        action_position_ids = (
+            action_position_ids_t,
+            action_position_ids_t,
+            action_position_ids_t,
+        )
 
         key_layer_action = self.apply_rotary_embeddings(
-            key_layer_action, (d_mask_actions, d_mask_actions, d_mask_actions)
+            key_layer_action, action_position_ids
         )
         query_layer_action = self.apply_rotary_embeddings(
-            query_layer_action, (d_mask_actions, d_mask_actions, d_mask_actions)
+            query_layer_action, action_position_ids
         )
 
         # shape: (b, n_head, seq_len, d)
@@ -301,6 +296,9 @@ class VJEPA2JointDiffuserLayer(GradientCheckpointingLayer):
         action_hidden_states: torch.Tensor,
         video_modulation: torch.Tensor,
         action_modulation: torch.Tensor,
+        video_fps: float,
+        action_fps: float,
+        num_condition_frames: int,
         position_mask: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
@@ -320,6 +318,9 @@ class VJEPA2JointDiffuserLayer(GradientCheckpointingLayer):
         self_attention_outputs = self.attention(
             video_hidden_states * (1 + video_scale) + video_shift,
             action_hidden_states * (1 + action_scale) + action_shift,
+            video_fps,
+            action_fps,
+            num_condition_frames,
             position_mask=position_mask,  # position mask for context/target selection
             head_mask=head_mask,  # head mask is applied at F.scaled_dot_product_attention
             output_attentions=output_attentions,
@@ -382,6 +383,7 @@ class VJEPA2JointDiffuser(nn.Module):
         self.config = config
 
         self.embeddings = VJEPA2Embeddings(config, hidden_size=config.hidden_size)
+        self.cond_embed = nn.Parameter(torch.randn(1, config.hidden_size) * 0.02)
         self.action_embeddings = ActionEmbeddings(
             action_dim=action_dim, embed_dim=config.hidden_size
         )
@@ -426,10 +428,13 @@ class VJEPA2JointDiffuser(nn.Module):
     @can_return_tuple
     def forward(
         self,
-        pixel_values_videos: torch.Tensor,
-        actions: torch.Tensor,
+        video_latents: torch.Tensor,
+        action: torch.Tensor,
         video_t: torch.Tensor,
-        actions_t: torch.Tensor,
+        action_t: torch.Tensor,
+        video_fps: float,
+        action_fps: float,
+        num_condition_frames: int,
         head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
@@ -438,10 +443,14 @@ class VJEPA2JointDiffuser(nn.Module):
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
 
-        video_hidden_states = self.embeddings(pixel_values_videos)
-        action_hidden_states = self.action_embeddings.embed(actions)
+        # `video` is noisy latents
+        video_hidden_states = video_latents
+        video_hidden_states[
+            :, : (num_condition_frames // self.config.tubelet_size)
+        ] += self.cond_embed
+        action_hidden_states = self.action_embeddings.embed(action)
         video_modulation = self.video_modulation(video_t)
-        action_modulation = self.action_modulation(actions_t)
+        action_modulation = self.action_modulation(action_t)
 
         for i, layer_module in enumerate(self.layer):
             layer_head_mask = head_mask[i] if head_mask is not None else None
@@ -450,6 +459,9 @@ class VJEPA2JointDiffuser(nn.Module):
                 action_hidden_states,
                 video_modulation,
                 action_modulation,
+                video_fps,
+                action_fps,
+                num_condition_frames,
                 None,
                 layer_head_mask,
                 output_attentions,
