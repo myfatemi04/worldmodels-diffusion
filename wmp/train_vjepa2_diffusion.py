@@ -77,6 +77,9 @@ def main():
             pixel_values_videos=pv, skip_predictor=True
         ).last_hidden_state
 
+    # normalize
+    video_latents = (video_latents - video_latents.mean()) / video_latents.std()
+
     sigmas = get_sampling_sigmas(sampling_steps=8, shift=1).to(device)
     sigma_probs = logit_normal_distribution(sigmas, mu=0, sigma=1).to(device)
 
@@ -119,8 +122,8 @@ def main():
         if (i % 500) == 0:
             # save checkpoint
             import os
-            os.makedirs("./checkpoints", exist_ok=True)
-            torch.save(model.state_dict(), f"./checkpoints/model_{i}.pth")
+            os.makedirs("./checkpoints_2", exist_ok=True)
+            torch.save(model.state_dict(), f"./checkpoints_2/model_{i}.pth")
 
 
 if __name__ == "__main__":
