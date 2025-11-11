@@ -1,13 +1,14 @@
+import os
 from typing import cast
 
 import av
-from torch.utils.tensorboard import SummaryWriter
 import torch
 import torch.nn.functional as F
+from loguru import logger
+from torch.utils.tensorboard import SummaryWriter
 from transformers import VJEPA2Model, VJEPA2VideoProcessor
 
 from wmp.modeling_vjepa2 import VJEPA2JointDiffuser
-from loguru import logger
 
 
 def load_video(path):
@@ -39,14 +40,15 @@ def main():
     model = VJEPA2JointDiffuser(config=original_model.config, action_dim=2)
     optim = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
-    missing_keys, unexpected_keys = model.load_state_dict(
-        original_model.encoder.state_dict(), strict=False
-    )
+    model.load_state_dict(torch.load("checkpoints_0/model_600.pth"))
 
-    if len(unexpected_keys) > 0:
-        print(unexpected_keys)
-    else:
-        print("No unexpected keys")
+    # missing_keys, unexpected_keys = model.load_state_dict(
+    #     original_model.encoder.state_dict(), strict=False
+    # )
+    # if len(unexpected_keys) > 0:
+    #     print(unexpected_keys)
+    # else:
+    #     print("No unexpected keys")
 
     processor = cast(VJEPA2VideoProcessor, VJEPA2VideoProcessor.from_pretrained(ckpt))
 
@@ -116,9 +118,10 @@ def main():
             f"Step {i}: Loss =  {video_flow_error.item()} (video) + {action_flow_error.item()} (action) = {loss.item()}"
         )
 
-        if (i % 100) == 0:
+        if (i + 1) % 500 == 0:
             # save checkpoint
-            torch.save(model.state_dict(), f"./checkpoints/model_{i}.pth")
+            os.makedirs("checkpoints", exist_ok=True)
+            torch.save(model.state_dict(), f"./checkpoints/model_{i + 1}.pth")
 
 
 if __name__ == "__main__":

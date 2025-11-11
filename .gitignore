@@ -1,4 +1,6 @@
 .venv
 outputs
 **/__pycache__
-runs
+runs*
+checkpoints*
+**/.DS_Store
