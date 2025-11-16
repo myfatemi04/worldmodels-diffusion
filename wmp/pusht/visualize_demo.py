@@ -44,27 +44,28 @@ def render_demonstration(env: PushTEnv, states: torch.Tensor) -> list[np.ndarray
     return images
 
 
-env = gym.make(
-    "gym_pusht/PushT-v0",
-    render_mode="rgb_array",
-    visualization_width=512,
-    visualization_height=512,
-)
+if __name__ == "__main__":
+    env = gym.make(
+        "gym_pusht/PushT-v0",
+        render_mode="rgb_array",
+        visualization_width=512,
+        visualization_height=512,
+    )
 
-demos = load_demonstrations()
-states, abs_actions, rel_actions = demos[0]
+    demos = load_demonstrations()
+    states, abs_actions, rel_actions = demos[0]
 
-video = render_demonstration(env.env.env.env, states)  # type: ignore
+    video = render_demonstration(env.env.env.env, states)  # type: ignore
 
-# Save video.
-container = av.open("pusht_demo.mp4", mode="w")
-stream = container.add_stream("libx264", rate=30)
-stream.width = 512
-stream.height = 512
-for frame in video:
-    frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
-    for packet in stream.encode(frame):
+    # Save video.
+    container = av.open("pusht_demo.mp4", mode="w")
+    stream = container.add_stream("libx264", rate=30)
+    stream.width = 512
+    stream.height = 512
+    for frame in video:
+        frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
+        for packet in stream.encode(frame):
+            container.mux(packet)
+    for packet in stream.encode():
         container.mux(packet)
-for packet in stream.encode():
-    container.mux(packet)
-container.close()
+    container.close()
