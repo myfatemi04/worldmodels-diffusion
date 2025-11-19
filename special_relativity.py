@@ -4,6 +4,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 try:
+    """
+    if these are unavailable, the frames will be rendered directly to the screen using matplotlib.
+    """
     import PIL.Image as Image
     import av
 except ImportError:
@@ -50,15 +53,20 @@ BETA = V
 GAMMA = 1 / np.sqrt(1 - V**2)
 
 TRAIN_PROPER_WIDTH = 5
-TRAIN_OBSERVER_WIDTH = TRAIN_PROPER_WIDTH / GAMMA
+# TRAIN_OBSERVER_WIDTH = TRAIN_PROPER_WIDTH / GAMMA
 TRAIN_HEIGHT = 3
 X_MAX = 10
 X_MIN = -10
 
-T_MAX = (X_MAX + TRAIN_OBSERVER_WIDTH) / V
-T_MIN = -(X_MAX + TRAIN_OBSERVER_WIDTH) / V
-T_PRIME_MIN = GAMMA * (T_MIN - BETA * X_MAX)
-T_PRIME_MAX = GAMMA * (T_MAX - BETA * X_MIN)
+# T_MAX = (X_MAX + TRAIN_OBSERVER_WIDTH) / V
+# T_MIN = -(X_MAX + TRAIN_OBSERVER_WIDTH) / V
+# T_PRIME_MIN = GAMMA * (T_MIN - BETA * X_MAX)
+# T_PRIME_MAX = GAMMA * (T_MAX - BETA * X_MIN)
+
+
+# Set manually, based on the world lines plot, was better to do it that way.
+T_MAX = 10
+T_MIN = -10
 
 
 def generate_moving_frame_photon_example_events(photon_movement_style="reflections"):
@@ -78,7 +86,7 @@ def generate_moving_frame_photon_example_events(photon_movement_style="reflectio
     # plt.plot(t, wave)
     # plt.show()
 
-    for t in np.linspace(T_PRIME_MIN, T_PRIME_MAX, 500):
+    for t in np.linspace(-20, 20, 500):
         # Train corners are at the same position at all times.
         events["train_topleft_corner"].append(
             (t, -TRAIN_PROPER_WIDTH / 2, TRAIN_HEIGHT)
@@ -150,7 +158,6 @@ def generate_falling_balls_example_events():
         events["train_bottomright_corner"].append((t, TRAIN_PROPER_WIDTH / 2, 0))
 
     for t in np.linspace(0, TRAIN_PROPER_WIDTH / 2, 50):
-        # Make the end of this event correspond to t = 0.
         photon_t = t
         t = t - base_t
         events["left_ball"].append((t, -TRAIN_PROPER_WIDTH / 2, TRAIN_PROPER_WIDTH / 2))
@@ -194,6 +201,7 @@ def generate_falling_balls_example_events():
         right_ball_theta_dot -= u * np.sin(right_ball_theta) * dt
         left_ball_theta += left_ball_theta_dot * dt
         right_ball_theta += right_ball_theta_dot * dt
+        # damping, implemented as decay in velocity, so that ball movement looks more natural
         left_ball_theta_dot = left_ball_theta_dot * 0.98
         right_ball_theta_dot = right_ball_theta_dot * 0.98
 
@@ -268,10 +276,11 @@ def interpolate_worldlines(events, t):
     return interpolated_events
 
 
-def plot_world_lines(events):
+def plot_world_lines(events, title):
     # Plot the worldlines of the events.
-    plt.figure(figsize=(10, 10))
-    plt.title("Worldlines")
+    # plt.figure(figsize=(10, 10))
+    plt.clf()
+    plt.title(title)
     plt.xlim(X_MIN - 1, X_MAX + 1)
     plt.ylim(T_MIN - 1, T_MAX + 1)
 
@@ -291,18 +300,21 @@ def plot_world_lines(events):
     plt.xlabel("Position (m)")
     plt.ylabel("Time (m/c)")
 
+    plt.grid()
+
     plt.legend()
     plt.show()
 
 
-def plot_events(events):
-    plt.figure(figsize=(10, 6))
-    plt.title("Rest Frame View of Moving Train and Photon")
-    plt.xlim(X_MIN - 1, X_MAX + 1)
-    plt.ylim(-1, TRAIN_HEIGHT + 1)
-    plt.axhline(0, color="black", linewidth=0.5)
+def plot_events(events, title):
+    # plt.figure(figsize=(10, 6))
+    # plt.xlim(X_MIN - 1, X_MAX + 1)
+    # plt.ylim(-1, TRAIN_HEIGHT + 1)
+    # plt.axhline(0, color="black", linewidth=0.5)
 
     for t in np.linspace(-T_MAX, T_MAX, 50):
+        plt.clf()
+        plt.title(title)
         plt.xlim(X_MIN - 1, X_MAX + 1)
 
         resolved = interpolate_worldlines(events, t)
@@ -322,7 +334,10 @@ def plot_events(events):
             resolved["train_topleft_corner"][2],
             resolved["train_bottomleft_corner"][2],
         ]
-        plt.plot(train_xs, train_ys, color="blue", linewidth=3)
+        plt.plot(train_xs, train_ys, color="blue", label="Train", linewidth=3)
+        plt.plot(
+            [X_MIN - 1, X_MAX + 1], [-0.2, -0.2], color="darkgoldenrod", linewidth=3
+        )
 
         # Set axes to be equal
         plt.gca().set_aspect("equal", adjustable="box")
@@ -336,10 +351,11 @@ def plot_events(events):
         plt.xlabel("Position (m)")
         plt.ylabel("Height (m)")
         plt.grid()
-        plt.show()
+        # plt.show()
+        plt.pause(0.1)
 
 
-def plot_events_with_ball(events, title):
+def plot_events_with_ball(events, title, save_video=False):
     # plt.figure(figsize=(10, 10))
     # plt.xlim(X_MIN - 1, X_MAX + 1)
     # plt.ylim(-1, TRAIN_HEIGHT + 1)
@@ -349,9 +365,8 @@ def plot_events_with_ball(events, title):
     imgs = []
 
     for t in np.linspace(-T_MAX, T_MAX, 50):
-        plt.figure(figsize=(10, 10))
-
-        plt.title("Consistency of simultaneity, v={}".format(title))
+        plt.clf()
+        plt.title(title)
 
         plt.xlim(X_MIN - 1, X_MAX + 1)
         plt.ylim(-1, TRAIN_HEIGHT * 3 + 1)
@@ -373,7 +388,8 @@ def plot_events_with_ball(events, title):
             resolved["train_topleft_corner"][2],
             resolved["train_bottomleft_corner"][2],
         ]
-        plt.plot(train_xs, train_ys, color="gold", linewidth=3)
+        plt.plot(train_xs, train_ys, color="blue", label="Train", linewidth=3)
+        plt.plot([X_MIN - 1, X_MAX + 1], [0, 0], color="darkgoldenrod", linewidth=3)
 
         # Draw arc that the balls fall along
         theta = np.linspace(-np.pi / 2, np.pi / 2, 100)
@@ -419,7 +435,7 @@ def plot_events_with_ball(events, title):
         plt.ylabel("Height (m)")
         plt.grid()
 
-        if Image is not None:
+        if save_video and Image is not None:
             plt.savefig(bio, format="png")
 
             bio.seek(0)
@@ -427,11 +443,13 @@ def plot_events_with_ball(events, title):
 
             bio.truncate(0)
             bio.seek(0)
-        else:
-            plt.show()
 
-    if av is not None and len(imgs) > 0:
-        output = av.open(f"falling_balls_simulation_{title}.mp4", mode="w")
+        plt.pause(0.1)
+
+    if save_video and av is not None and len(imgs) > 0:
+        output = av.open(
+            f"falling_balls_simulation_{title.split('=')[-1].strip()}.mp4", mode="w"
+        )
         stream = output.add_stream("libx264", rate=10)
         stream.width = imgs[0].width
         stream.height = imgs[0].height
@@ -451,36 +469,27 @@ def plot_events_with_ball(events, title):
         output.close()
 
 
-# train_example = generate_moving_frame_photon_example_events()
-
-# rest_frame_events = inverse_lorentz_transform(train_example, V)
-
-# plot_world_lines(inverse_lorentz_transform(train_example, 0))
-# plot_world_lines(inverse_lorentz_transform(train_example, 0.5 * V))
-# plot_world_lines(inverse_lorentz_transform(train_example, V))
-
-# plot_events(rest_frame_events)
-
-T_MAX = 10
-T_MIN = -10
-
-train_example_with_balls = generate_falling_balls_example_events()
-
-# plot_world_lines(inverse_lorentz_transform(train_example_with_balls, 0))
-# plot_world_lines(inverse_lorentz_transform(train_example_with_balls, 0.5 * V))
-# plot_world_lines(inverse_lorentz_transform(train_example_with_balls, V))
-
-# plot_events_with_ball(
-#     inverse_lorentz_transform(train_example_with_balls, 0), title="normal"
-# )
-# plot_events_with_ball(
-#     inverse_lorentz_transform(train_example_with_balls, 0.5 * V), title="0.3c"
-# )
-# plot_events_with_ball(
-#     inverse_lorentz_transform(train_example_with_balls, V), title="0.6c"
-# )
+def demo(events, title, v_values):
+    for v in v_values:
+        plot_world_lines(
+            inverse_lorentz_transform(events, v), title=title + " v={}c".format(v)
+        )
+        if "ball" in title.lower():
+            plot_events_with_ball(
+                inverse_lorentz_transform(events, v), title=title + " v={}c".format(v)
+            )
+        else:
+            plot_events(
+                inverse_lorentz_transform(events, v), title=title + " v={}c".format(v)
+            )
 
 
-plot_events_with_ball(
-    inverse_lorentz_transform(train_example_with_balls, 0.9), title="0.9c"
-)
+if __name__ == "__main__":
+    plt.rcParams["figure.figsize"] = (10, 10)
+
+    train_example = generate_moving_frame_photon_example_events()
+
+    demo(train_example, "Bouncing photon", [0, 0.3, 0.6, 0.9])
+
+    train_example_with_balls = generate_falling_balls_example_events()
+    demo(train_example_with_balls, "Rolling balls", [0, 0.3, 0.6, 0.9])
