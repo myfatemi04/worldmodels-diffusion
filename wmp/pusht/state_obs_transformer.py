@@ -204,13 +204,17 @@ class StateObservationTransformer(nn.Module):
             "sigma": sigma,
         }
 
-    def sample(self, horizon, N, deterministic=True):
+    def sample(self, horizon, N, deterministic=True, initial_noise_seed=None):
         device = next(self.parameters()).device
         sigmas = edm_sample_timesteps(N).to(device)
 
         # Generate initial sample.
-        states = torch.randn(1, horizon, 5).to(device)
-        actions = torch.randn(1, horizon, 2).to(device)
+        if initial_noise_seed is None:
+            initial_noise_seed = int(torch.randint(0, 1000000, ()).item())
+        generator = torch.Generator()
+        generator.manual_seed(initial_noise_seed)
+        states = torch.randn(1, horizon, 5, generator=generator).to(device)
+        actions = torch.randn(1, horizon, 2, generator=generator).to(device)
 
         for i in range(N):
             # "source_t" is here so that code can be shared between the stochastic and deterministic samplers. If deterministic == False, then it is equivalent to the original t. Otherwise, we add a temporary increased noise level to create "Langevin churn".

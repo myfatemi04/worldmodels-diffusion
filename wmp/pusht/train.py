@@ -1,3 +1,6 @@
+# pip install av loguru matplotlib gymnasium gym-pusht "pymunk<7"
+# apt install libgl1-mesa-glx
+
 import pickle
 
 import matplotlib.pyplot as plt
@@ -5,6 +8,10 @@ import torch
 
 from wmp.pusht.state_obs_transformer import StateObservationTransformer
 from loguru import logger
+import gymnasium as gym
+from gym_pusht.envs.pusht import PushTEnv
+import numpy as np
+import av
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -118,8 +125,36 @@ class Dataset(torch.utils.data.Dataset):
         )
         norm_states = norm_states.float()
         norm_rel_actions = norm_rel_actions.float()
+        norm_abs_actions = norm_abs_actions.float()
 
         return norm_states, norm_abs_actions, norm_rel_actions
+
+
+def render_demonstration(env: PushTEnv, states: torch.Tensor) -> list[np.ndarray]:
+    # Creates a video ndarray in [T, H, W, C] int8 format.
+    images = []
+
+    env.reset()
+    for state in states:
+        env._set_state(state.detach().cpu().numpy())
+        images.append(env.render())
+
+    return images
+
+
+def save_video(filename: str, video):
+    # Save video.
+    container = av.open(filename, mode="w")
+    stream = container.add_stream("libx264", rate=30)
+    stream.width = 512
+    stream.height = 512
+    for frame in video:
+        frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
+        for packet in stream.encode(frame):
+            container.mux(packet)
+    for packet in stream.encode():
+        container.mux(packet)
+    container.close()
 
 
 def main():
@@ -127,10 +162,10 @@ def main():
     dataset = Dataset(demos, h=32, device=device)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=1024, shuffle=True)
 
-    transformer = StateObservationTransformer(
+    model = StateObservationTransformer(
         embedding_dim=256, layers=6, heads=8, sigma_data=0.5
     ).to(device=device)
-    optimizer = torch.optim.Adam(transformer.parameters(), lr=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
     buckets = torch.tensor(
         [
@@ -150,11 +185,21 @@ def main():
     action_loss_steps_by_bucket = {}
     seen = 0
 
-    for epoch in range(50):
+    env = gym.make(
+        "gym_pusht/PushT-v0",
+        render_mode="rgb_array",
+        visualization_width=512,
+        visualization_height=512,
+    )
+
+    model.load_state_dict(torch.load("transformer_model_epoch_50.pth"))
+
+    epoch = 50
+    for _ in range(100):
         for norm_states, norm_abs_actions, norm_rel_actions in dataloader:
             seen += 1
 
-            loss = transformer.get_loss(norm_states, norm_rel_actions)
+            loss = model.get_loss(norm_states, norm_abs_actions)
 
             optimizer.zero_grad()
             loss["total"].backward()
@@ -185,6 +230,24 @@ def main():
             if seen % 100 == 0:
                 logger.info(f"Step {seen}, Loss: {loss['total'].item()}")
 
+        # Every so often, we want to visualize samples from the model.
+        # These samples can be rendered as videos and then saved. The
+        # rendering can be done directly by the environment.
+        for seed in range(5):
+            states, actions = model.sample(
+                horizon=32, N=50, deterministic=True, initial_noise_seed=seed
+            )
+
+            # Denormalize states
+            states = states.squeeze(0)
+            states = states * (2 * dataset.state_std) + dataset.state_mean
+
+            # pusht environment has several wrappers
+            video = render_demonstration(env.env.env.env, states)  # type: ignore
+            save_video(f"sample_epoch={epoch}_seed={seed}.mp4", video)
+
+        epoch += 1
+
     for i in sorted(state_losses_by_bucket):
         plt.title("State loss for bucket")
         plt.plot(
@@ -212,7 +275,7 @@ def main():
         plt.clf()
 
     # Save the model.
-    torch.save(transformer.state_dict(), "transformer_model.pth")
+    torch.save(model.state_dict(), f"transformer_model_epoch_{epoch}.pth")
 
 
 if __name__ == "__main__":
