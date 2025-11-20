@@ -205,14 +205,34 @@ class StateObservationTransformer(nn.Module):
         actions = torch.randn(1, horizon, 2).to(device)
 
         for i in range(N):
+            # "source_t" is here so that code can be shared between the stochastic and deterministic samplers. If deterministic == False, then it is equivalent to the original t. Otherwise, we add a temporary increased noise level to create "Langevin churn".
+            source_t = sigmas[i]
+            if not deterministic:
+                S_churn = 80
+                S_tmin = 0.05
+                S_tmax = 50
+                gamma = (
+                    min(S_churn / N, math.sqrt(2) - 1)
+                    if S_tmin <= source_t <= S_tmax
+                    else 0
+                )
+                if gamma != 0:
+                    source_t = sigmas[i] * (1 + gamma)
+                    states = states + torch.randn_like(states) * math.sqrt(
+                        source_t**2 - sigmas[i] ** 2
+                    )
+                    actions = actions + torch.randn_like(actions) * math.sqrt(
+                        source_t**2 - sigmas[i] ** 2
+                    )
+
             # Evaluate dx/dt.
-            states_pred, actions_pred = self(states, actions, sigmas[i])
-            states_d = 1 / sigmas[i] * (states - states_pred)
-            actions_d = 1 / sigmas[i] * (actions - actions_pred)
+            states_pred, actions_pred = self(states, actions, source_t)
+            states_d = 1 / source_t * (states - states_pred)
+            actions_d = 1 / source_t * (actions - actions_pred)
 
             # Euler step.
-            states_next = states + states_d * (sigmas[i + 1] - sigmas[i])
-            actions_next = actions + actions_d * (sigmas[i + 1] - sigmas[i])
+            states_next = states + states_d * (sigmas[i + 1] - source_t)
+            actions_next = actions + actions_d * (sigmas[i + 1] - source_t)
 
             # Apply second-order correction if needed.
             if sigmas[i + 1] != 0:
@@ -220,10 +240,10 @@ class StateObservationTransformer(nn.Module):
                 states_d_prime = 1 / sigmas[i + 1] * (states_next - states_pred)
                 actions_d_prime = 1 / sigmas[i + 1] * (actions_next - actions_pred)
                 # Trapezoidal rule.
-                states_next = states_next + (sigmas[i + 1] - sigmas[i]) * 0.5 * (
+                states_next = states_next + (sigmas[i + 1] - source_t) * 0.5 * (
                     states_d + states_d_prime
                 )
-                actions_next = actions_next + (sigmas[i + 1] - sigmas[i]) * 0.5 * (
+                actions_next = actions_next + (sigmas[i + 1] - source_t) * 0.5 * (
                     actions_d + actions_d_prime
                 )
 
