@@ -59,9 +59,10 @@ def rope_embedding_1d(data: torch.Tensor, max_len: float):
     freqs = torch.polar(torch.ones_like(freqs), freqs)
 
     # View as complex, rotate, and then view as real.
-    data = torch.view_as_complex(data.reshape(*data.shape[:-1], -1, 2))
+    shape = data.shape
+    data = torch.view_as_complex(data.reshape(*shape[:-1], -1, 2))
     data = data * freqs
-    data = torch.view_as_real(data).reshape(*data.shape[:-2], -1)
+    data = torch.view_as_real(data).reshape(*shape[:-1], -1)
     return data
 
 
@@ -142,7 +143,7 @@ class StateObservationTransformer(nn.Module):
         self.diffusion_step_mlp = nn.Sequential(
             nn.Linear(128, 128),
             nn.GELU(approximate="tanh"),
-            nn.Linear(128, self.embedding_dim),
+            nn.Linear(128, self.embedding_dim * 3),
         )
         self.layers = nn.ModuleList(
             [Attention(embedding_dim, nhead=heads) for _ in range(layers)]
@@ -191,10 +192,15 @@ class StateObservationTransformer(nn.Module):
 
         states_pred, actions_pred = self.forward(states_noisy, actions_noisy, sigma)
 
-        state_loss = ((states_pred - states) ** 2).mean(dim=(1, 2))
-        action_loss = ((actions_pred - actions) ** 2).mean(dim=(1, 2))
-        loss = (state_loss + action_loss) * loss_weight
-        return loss.mean()
+        state_loss = ((states_pred - states) ** 2).mean(dim=(1, 2)) * loss_weight
+        action_loss = ((actions_pred - actions) ** 2).mean(dim=(1, 2)) * loss_weight
+
+        return {
+            "state_loss": state_loss,
+            "action_loss": action_loss,
+            "total": state_loss.mean() + action_loss.mean(),
+            "sigma": sigma,
+        }
 
     def sample(self, horizon, N, deterministic=True):
         device = next(self.parameters()).device
