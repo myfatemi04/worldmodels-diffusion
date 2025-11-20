@@ -18,6 +18,10 @@ Diffusion timesteps are represented through AdaLN:
 
 To allow communication between the modalities, we use separate weight matrices for queries, keys, and values for the states and actions.
 They undergo full attention together. Then, they get passed through separate MLPs.
+
+For the modeling approach, we can use diffusion or flow matching. I am inclined to use diffusion because of its connection to the energy-based formulation. For this, I will use EDM preconditioning: https://arxiv.org/pdf/2206.00364
+
+The ODE integration can be done separately, as long as some predictor of the original sample is provided. So, the model only needs to expose a `get_loss` and forward pass function.
 """
 
 import math
@@ -106,11 +110,31 @@ class Attention(nn.Module):
         return state_z, action_z
 
 
+def edm_coefficients(sigma: torch.Tensor, sigma_data: float):
+    c_skip = (sigma_data**2) / (sigma**2 + sigma_data**2)
+    c_out = sigma * sigma_data / torch.sqrt(sigma**2 + sigma_data**2)
+    c_in = 1 / (sigma**2 + sigma_data**2)
+    c_noise = torch.log(sigma) / 4.0
+    return c_skip, c_out, c_in, c_noise
+
+
+def edm_sample_timesteps(N, rho=7, sigma_min=0.002, sigma_max=80):
+    """i = 0 corresponds to sigma_max. i = N corresponds to sigma = 0."""
+    sigmas = (
+        sigma_max ** (1 / rho)
+        + torch.arange(N) / (N - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))
+    ) ** (1 / rho)
+    # add sigma = 0 so that we can use sigmas[N] = 0
+    sigmas = torch.cat([sigmas, torch.zeros(1)], dim=0)
+    return sigmas
+
+
 class StateObservationTransformer(nn.Module):
-    def __init__(self, embedding_dim: int, layers: int = 6, heads: int = 8):
+    def __init__(self, embedding_dim, layers=6, heads=8, sigma_data=0.5):
         super().__init__()
 
         self.embedding_dim = embedding_dim
+        self.sigma_data = sigma_data
         self.state_proj = nn.Linear(5, embedding_dim)
         self.action_proj = nn.Linear(2, embedding_dim)
         self.state_unproj = nn.Linear(embedding_dim, 5)
@@ -124,17 +148,86 @@ class StateObservationTransformer(nn.Module):
             [Attention(embedding_dim, nhead=heads) for _ in range(layers)]
         )
 
-    def forward(
-        self, states: torch.Tensor, actions: torch.Tensor, diffusion_step: torch.Tensor
-    ):
-        state_z = self.state_proj(states)
-        action_z = self.action_proj(actions)
-        e = self.diffusion_step_mlp(
-            sinusoidal_positional_encoding(diffusion_step, 128, 4.0)
-        )
+    def forward(self, states, actions, sigma):
+        """Does EDM preconditioning for us."""
 
-        # Apply attention
+        # coefficients: (B,)
+        # states: (B, T, 5)
+        # actions: (B, T, 2)
+        c_skip, c_out, c_in, c_sigma = edm_coefficients(sigma, self.sigma_data)
+        c_skip = c_skip.view(-1, 1, 1)
+        c_out = c_out.view(-1, 1, 1)
+        c_in = c_in.view(-1, 1, 1)
+        c_sigma = c_sigma.view(-1, 1, 1)
+
+        state_z = self.state_proj(c_in * states)
+        action_z = self.action_proj(c_in * actions)
+        e = self.diffusion_step_mlp(sinusoidal_positional_encoding(c_sigma, 128, 4.0))
+
         for layer in self.layers:
             state_z, action_z = layer(state_z, action_z, e)
 
-        return state_z
+        states_prime = self.state_unproj(state_z)
+        actions_prime = self.action_unproj(action_z)
+
+        return (
+            states * c_skip + states_prime * c_out,
+            actions * c_skip + actions_prime * c_out,
+        )
+
+    def get_loss(self, states, actions):
+        states_noise = torch.randn_like(states)
+        actions_noise = torch.randn_like(actions)
+
+        P_mean = 1.2
+        P_std = 1.2
+        sigma = torch.exp(
+            torch.randn(states.shape[0], device=states.device) * P_std + P_mean
+        )  # (B,)
+        loss_weight = (sigma**2 + self.sigma_data**2) / (sigma * self.sigma_data) ** 2
+
+        states_noisy = states + states_noise * sigma.view(-1, 1, 1)
+        actions_noisy = actions + actions_noise * sigma.view(-1, 1, 1)
+
+        states_pred, actions_pred = self.forward(states_noisy, actions_noisy, sigma)
+
+        state_loss = ((states_pred - states) ** 2).mean(dim=(1, 2))
+        action_loss = ((actions_pred - actions) ** 2).mean(dim=(1, 2))
+        loss = (state_loss + action_loss) * loss_weight
+        return loss.mean()
+
+    def sample(self, horizon, N, deterministic=True):
+        device = next(self.parameters()).device
+        sigmas = edm_sample_timesteps(N).to(device)
+
+        # Generate initial sample.
+        states = torch.randn(1, horizon, 5).to(device)
+        actions = torch.randn(1, horizon, 2).to(device)
+
+        for i in range(N):
+            # Evaluate dx/dt.
+            states_pred, actions_pred = self(states, actions, sigmas[i])
+            states_d = 1 / sigmas[i] * (states - states_pred)
+            actions_d = 1 / sigmas[i] * (actions - actions_pred)
+
+            # Euler step.
+            states_next = states + states_d * (sigmas[i + 1] - sigmas[i])
+            actions_next = actions + actions_d * (sigmas[i + 1] - sigmas[i])
+
+            # Apply second-order correction if needed.
+            if sigmas[i + 1] != 0:
+                # Evaluate dx/dt at next step.
+                states_d_prime = 1 / sigmas[i + 1] * (states_next - states_pred)
+                actions_d_prime = 1 / sigmas[i + 1] * (actions_next - actions_pred)
+                # Trapezoidal rule.
+                states_next = states_next + (sigmas[i + 1] - sigmas[i]) * 0.5 * (
+                    states_d + states_d_prime
+                )
+                actions_next = actions_next + (sigmas[i + 1] - sigmas[i]) * 0.5 * (
+                    actions_d + actions_d_prime
+                )
+
+            states = states_next
+            actions = actions_next
+
+        return (states, actions)
