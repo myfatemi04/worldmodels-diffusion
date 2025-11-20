@@ -193,7 +193,7 @@ class VJEPA2JointDiffuserRopeAttention(nn.Module):
             num_condition_frames - 1
         ) / self.config.tubelet_size
         action_position_ids_t = (
-            torch.arange(action_hidden_states.shape[-2]) * (video_fps / action_fps)
+            torch.arange(action_hidden_states.shape[-2], device=action_hidden_states.device) * (video_fps / action_fps)
             + final_observation_frame_position_id
         )
         # Use same position IDs for all dimensions. This strategy is used in Qwen2.5-Omni, page 4.
@@ -367,7 +367,7 @@ class SinusoidalPosEmbed(nn.Module):
     def forward(self, position: torch.Tensor):
         angle = torch.exp(
             torch.log(position.unsqueeze(-1) / self.max_length)
-            * (torch.arange(0, self.size, 2) / float(self.size))
+            * (torch.arange(0, self.size, 2).to(position.device) / float(self.size))
         )
         embed = torch.zeros(
             (*position.shape, self.size), device=position.device, dtype=self.dtype

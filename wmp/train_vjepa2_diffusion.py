@@ -34,10 +34,10 @@ def logit_normal_distribution(x, mu, sigma):
 
 
 def main():
-    device = "cpu"
+    device = "cuda"
     ckpt = "facebook/vjepa2-vitl-fpc64-256"
     original_model = VJEPA2Model.from_pretrained(ckpt).to(device)  # type: ignore
-    model = VJEPA2JointDiffuser(config=original_model.config, action_dim=2)
+    model = VJEPA2JointDiffuser(config=original_model.config, action_dim=2).to(device)
     optim = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
     model.load_state_dict(torch.load("checkpoints_0/model_600.pth"))
@@ -54,7 +54,7 @@ def main():
 
     # overfit to a single example
 
-    all_abs_actions = torch.load("./data/pusht_noise/train/abs_actions.pth")
+    all_abs_actions = torch.load("./data/pusht_noise/train/abs_actions.pth").to(device)
 
     # scale from [-200, 800] to [-1, 1]
     all_abs_actions = (all_abs_actions - (-200)) / (800 - (-200)) * 2 - 1
@@ -79,11 +79,16 @@ def main():
             pixel_values_videos=pv, skip_predictor=True
         ).last_hidden_state
 
-    sigmas = get_sampling_sigmas(sampling_steps=8, shift=1)
-    sigma_probs = logit_normal_distribution(sigmas, mu=0, sigma=1)
+    # normalize
+    video_latents = (video_latents - video_latents.mean()) / video_latents.std()
+
+    sigmas = get_sampling_sigmas(sampling_steps=8, shift=1).to(device)
+    sigma_probs = logit_normal_distribution(sigmas, mu=0, sigma=1).to(device)
 
     for i in range(10000):
-        sigma_index = torch.multinomial(sigma_probs, num_samples=1, replacement=False)
+        sigma_index = torch.multinomial(
+            sigma_probs, num_samples=1, replacement=False
+        ).to(device)
         sigma = sigmas[sigma_index]
         alpha = 1 - sigma
 
@@ -118,10 +123,12 @@ def main():
             f"Step {i}: Loss =  {video_flow_error.item()} (video) + {action_flow_error.item()} (action) = {loss.item()}"
         )
 
-        if (i + 1) % 500 == 0:
+        if (i % 500) == 0:
             # save checkpoint
-            os.makedirs("checkpoints", exist_ok=True)
-            torch.save(model.state_dict(), f"./checkpoints/model_{i + 1}.pth")
+            import os
+
+            os.makedirs("./checkpoints_2", exist_ok=True)
+            torch.save(model.state_dict(), f"./checkpoints_2/model_{i}.pth")
 
 
 if __name__ == "__main__":
