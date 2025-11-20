@@ -23,6 +23,8 @@ screen = pygame.display.set_mode((512, 512))
 pygame.display.set_caption("PushT Environment")
 running = True
 
+action_size = 2.0
+
 while running:
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
@@ -33,13 +35,13 @@ while running:
     # Handle key presses for actions
     keys = pygame.key.get_pressed()
     if keys[pygame.K_UP]:
-        action[1] -= 1.0
+        action[1] -= action_size
     if keys[pygame.K_DOWN]:
-        action[1] += 1.0
+        action[1] += action_size
     if keys[pygame.K_LEFT]:
-        action[0] -= 1.0
+        action[0] -= action_size
     if keys[pygame.K_RIGHT]:
-        action[0] += 1.0
+        action[0] += action_size
     if keys[pygame.K_q]:
         running = False
 

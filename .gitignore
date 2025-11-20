@@ -4,3 +4,4 @@ outputs
 runs*
 checkpoints*
 **/.DS_Store
+scratch
