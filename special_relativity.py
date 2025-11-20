@@ -471,17 +471,13 @@ def plot_events_with_ball(events, title, save_video=False):
 
 def demo(events, title, v_values):
     for v in v_values:
-        plot_world_lines(
-            inverse_lorentz_transform(events, v), title=title + " v={}c".format(v)
-        )
+        v_label = "rest" if v == 0 else f"v={v}c"
+        title_ = f"{title} in train at {v_label}"
+        plot_world_lines(inverse_lorentz_transform(events, v), title=title_)
         if "ball" in title.lower():
-            plot_events_with_ball(
-                inverse_lorentz_transform(events, v), title=title + " v={}c".format(v)
-            )
+            plot_events_with_ball(inverse_lorentz_transform(events, v), title=title_)
         else:
-            plot_events(
-                inverse_lorentz_transform(events, v), title=title + " v={}c".format(v)
-            )
+            plot_events(inverse_lorentz_transform(events, v), title=title_)
 
 
 if __name__ == "__main__":
