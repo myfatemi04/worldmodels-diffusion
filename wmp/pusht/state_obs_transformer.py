@@ -53,8 +53,10 @@ def rope_embedding_1d(data: torch.Tensor, max_len: float):
 
     # (seqlen, dim/2) complex tensor
     freqs = torch.outer(
-        torch.arange(seqlen),
-        torch.exp(-math.log(max_len) * torch.arange(0, dim, 2) / dim),
+        torch.arange(seqlen, device=data.device),
+        torch.exp(
+            -math.log(max_len) * torch.arange(0, dim, 2, device=data.device) / dim
+        ),
     )
     freqs = torch.polar(torch.ones_like(freqs), freqs)
 
