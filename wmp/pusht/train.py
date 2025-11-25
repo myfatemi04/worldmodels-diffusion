@@ -1,5 +1,4 @@
-# pip install av loguru matplotlib gymnasium gym-pusht "pymunk<7"
-# apt install libgl1-mesa-glx
+# pip install --root-user-action ignore accelerate diffusers av loguru matplotlib gymnasium gym-pusht "pymunk<7"; apt install -y libgl1-mesa-glx htop zip unzip
 
 import pickle
 
@@ -10,6 +9,7 @@ import numpy as np
 import torch
 from gym_pusht.envs.pusht import PushTEnv
 from loguru import logger
+import time
 
 """
 This is a diffusion-based transformer.
@@ -342,7 +342,7 @@ def compute_dataset_statistics(demos):
 
 
 class Dataset(torch.utils.data.Dataset):
-    def __init__(self, demos, h, device):
+    def __init__(self, demos, h, device, obs_mode="state", obs_size=512):
         # h = horizon
         demos = [d for d in demos if d[0].shape[0] >= h]
         self.demos = demos
@@ -364,6 +364,18 @@ class Dataset(torch.utils.data.Dataset):
         self.rel_action_mean = rel_action_mean.to(self.device)
         self.rel_action_std = rel_action_std.to(self.device)
         self.h = h
+        self.obs_mode = obs_mode
+        self.obs_size = obs_size
+
+        if obs_mode == "rgb":
+            self.env = gym.make(
+                "gym_pusht/PushT-v0",
+                render_mode="rgb_array",
+                visualization_width=obs_size,
+                visualization_height=obs_size,
+            )
+        else:
+            self.env = None
 
     def __len__(self):
         return len(self.demos)
@@ -380,18 +392,25 @@ class Dataset(torch.utils.data.Dataset):
         abs_actions = abs_actions[start_idx : start_idx + 32]
         rel_actions = rel_actions[start_idx : start_idx + 32]
 
-        norm_states = (states - self.state_mean) / (2 * self.state_std)
-        norm_abs_actions = (abs_actions - self.abs_action_mean) / (
-            2 * self.abs_action_std
-        )
-        norm_rel_actions = (rel_actions - self.rel_action_mean) / (
-            2 * self.rel_action_std
-        )
-        norm_states = norm_states.float()
-        norm_rel_actions = norm_rel_actions.float()
-        norm_abs_actions = norm_abs_actions.float()
+        norm_abs_actions = (
+            (abs_actions - self.abs_action_mean) / (2 * self.abs_action_std)
+        ).float()
+        norm_rel_actions = (
+            (rel_actions - self.rel_action_mean) / (2 * self.rel_action_std)
+        ).float()
 
-        return norm_states, norm_abs_actions, norm_rel_actions
+        # Compute normalized states.
+        if self.obs_mode == "state":
+            norm_states = (states - self.state_mean) / (2 * self.state_std)
+            norm_states = norm_states.float()
+
+            return norm_states, norm_abs_actions, norm_rel_actions
+
+        # Render images.
+        elif self.obs_mode == "rgb":
+            images = render_demonstration(self.env.env.env.env, states)
+
+            return images, norm_abs_actions, norm_rel_actions
 
 
 def render_demonstration(env: PushTEnv, states: torch.Tensor) -> list[np.ndarray]:
@@ -542,5 +561,75 @@ def main():
     torch.save(model.state_dict(), f"transformer_model_epoch_{epoch}.pth")
 
 
-if __name__ == "__main__":
-    main()
+def test_tokenizers():
+    # Load tokenizers
+    from diffusers import AutoencoderKLWan
+
+    wan21_tokenizer = AutoencoderKLWan.from_pretrained(
+        "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", subfolder="vae", low_cpu_mem_usage=True
+    ).to(device)
+    wan22_tokenizer = AutoencoderKLWan.from_pretrained(
+        "Wan-AI/Wan2.2-TI2V-5B-Diffusers", subfolder="vae", low_cpu_mem_usage=True
+    ).to(device)
+
+    # Get a sample 96x96 video
+    demos = load_demonstrations()
+
+    for size in [96, 128, 256, 512]:
+        dataset = Dataset(demos, h=32, device=device, obs_mode="rgb", obs_size=size)
+        video, abs_act, rel_act = dataset[0]
+
+        save_video(f"sample_{size}x{size}.mp4", video)
+        # Convert video to the expected format for Wan: (B, C, T, H, W) normalized to [-1, 1]
+        video = (
+            torch.from_numpy(np.stack(video, axis=0))
+            .permute(3, 0, 1, 2)
+            .unsqueeze(0)
+            .float()
+            / 127.5
+            - 1.0
+        )
+        video = video.to(device)
+
+        # Create batch size of 32
+        # video = video.repeat(32, 1, 1, 1, 1)
+
+        with torch.no_grad():
+            t0 = time.time()
+            encoded = wan21_tokenizer.encode(video).latent_dist.mode()
+            decoded = wan21_tokenizer.decode(encoded).sample
+            t1 = time.time()
+
+            print(f"Wan2.1 tokens (T, H, W): {encoded.shape[2:]} (t={t1 - t0:.2f}s)")
+
+        decoded = decoded[:1]
+
+        video_reconstructed = decoded.squeeze(0).permute(1, 2, 3, 0).cpu().numpy() + 1.0
+        video_reconstructed = (video_reconstructed * 127.5).astype(np.uint8)
+        save_video(f"reconstructed_wan2.1_{size}x{size}.mp4", video_reconstructed)
+        with torch.no_grad():
+            t0 = time.time()
+            encoded = wan22_tokenizer.encode(video).latent_dist.mode()
+            decoded = wan22_tokenizer.decode(encoded).sample
+            t1 = time.time()
+
+            print(f"Wan2.2 tokens (T, H, W): {encoded.shape[2:]} (t={t1 - t0:.2f}s)")
+
+        decoded = decoded[:1]
+
+        video_reconstructed = decoded.squeeze(0).permute(1, 2, 3, 0).cpu().numpy() + 1.0
+        video_reconstructed = (video_reconstructed * 127.5).astype(np.uint8)
+        save_video(f"reconstructed_wan2.2_{size}x{size}.mp4", video_reconstructed)
+
+
+# Train video model.
+from diffusers import AutoencoderKLWan, WanTransformer3DModel
+
+wan21_tokenizer = AutoencoderKLWan.from_pretrained(
+    "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", subfolder="vae", low_cpu_mem_usage=True
+).to(device)
+wan21_1_3_b = WanTransformer3DModel.from_pretrained(
+    "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", subfolder="transformer", low_cpu_mem_usage=True
+).to(device)
+
+# Sample from the model.

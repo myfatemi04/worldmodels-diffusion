@@ -5,3 +5,4 @@ runs*
 checkpoints*
 **/.DS_Store
 scratch
+*.zip
