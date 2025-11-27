@@ -1,8 +1,6 @@
 # pip install --root-user-action ignore accelerate diffusers av loguru matplotlib gymnasium gym-pusht "pymunk<7"; apt install -y libgl1-mesa-glx htop zip unzip
 
 # torchrun --nproc_per_node=1 --master_port=12341 -m scripts.train --config=train.py -- experiment=predict2_video2world_training_2b_pusht_128
-# or
-# python -m scripts.train --config=train.py -- experiment=predict2_video2world_training_2b_pusht_128
 
 import pickle
 
@@ -285,7 +283,7 @@ class StateObservationTransformer(nn.Module):
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def load_demonstrations(data_root="/root/data/pusht_noise/train/"):
+def load_demonstrations(data_root="/root/data/pusht_states_only/train"):
     states = torch.load(f"{data_root}/states.pth")
     with open(f"{data_root}/seq_lengths.pkl", "rb") as f:
         seq_lengths = pickle.load(f)
@@ -818,7 +816,7 @@ DEFAULT_CHECKPOINT = MODEL_CHECKPOINTS[ModelKey(post_trained=False)]
 
 # quirk of VideoDataset: must have at least num_frames + 1 frames in the video
 example_video_dataset = L(VideoDataset)(
-    dataset_dir="/root/sample_dataset",
+    dataset_dir="/root/cosmos-predict2.5/sample_dataset",
     num_frames=17,  # generate a bunch of videos
     video_size=(128, 128),
 )
@@ -878,7 +876,7 @@ predict2_video2world_training_2b_pusht_128 = dict(
     ),
     trainer=dict(
         logging_iter=100,
-        max_iter=1000,
+        max_iter=10000,
         callbacks=dict(
             heart_beat=dict(
                 save_s3=False,
