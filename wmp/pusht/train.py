@@ -344,7 +344,7 @@ def compute_dataset_statistics(demos):
 class Dataset(torch.utils.data.Dataset):
     def __init__(self, demos, h, device, obs_mode="state", obs_size=512):
         # h = horizon
-        demos = [d for d in demos if d[0].shape[0] >= h]
+        demos = [d for d in demos if d[0].shape[0] > h]
         self.demos = demos
 
         (
@@ -388,9 +388,9 @@ class Dataset(torch.utils.data.Dataset):
         rel_actions = rel_actions.to(self.device)
         start_idx = torch.randint(0, d[0].shape[0] - self.h, (1,)).item()
 
-        states = states[start_idx : start_idx + 32]
-        abs_actions = abs_actions[start_idx : start_idx + 32]
-        rel_actions = rel_actions[start_idx : start_idx + 32]
+        states = states[start_idx : start_idx + self.h]
+        abs_actions = abs_actions[start_idx : start_idx + self.h]
+        rel_actions = rel_actions[start_idx : start_idx + self.h]
 
         norm_abs_actions = (
             (abs_actions - self.abs_action_mean) / (2 * self.abs_action_std)
@@ -412,6 +412,9 @@ class Dataset(torch.utils.data.Dataset):
 
             return images, norm_abs_actions, norm_rel_actions
 
+        else:
+            raise ValueError(f"Unknown obs_mode {self.obs_mode}")
+
 
 def render_demonstration(env: PushTEnv, states: torch.Tensor) -> list[np.ndarray]:
     # Creates a video ndarray in [T, H, W, C] int8 format.
@@ -429,8 +432,8 @@ def save_video(filename: str, video):
     # Save video.
     container = av.open(filename, mode="w")
     stream = container.add_stream("libx264", rate=30)
-    stream.width = 512
-    stream.height = 512
+    stream.width = video[0].shape[1]
+    stream.height = video[0].shape[0]
     for frame in video:
         frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
         for packet in stream.encode(frame):
@@ -575,9 +578,21 @@ def test_tokenizers():
     # Get a sample 96x96 video
     demos = load_demonstrations()
 
+    # wan21_tokenizer.encoder = torch.compile(wan21_tokenizer.encoder)
+    # wan21_tokenizer.decoder = torch.compile(wan21_tokenizer.decoder)
+    # wan22_tokenizer.encoder = torch.compile(wan22_tokenizer.encoder)
+    # wan22_tokenizer.decoder = torch.compile(wan22_tokenizer.decoder)
+
+    # first one is to warm up the model
     for size in [96, 128, 256, 512]:
-        dataset = Dataset(demos, h=32, device=device, obs_mode="rgb", obs_size=size)
+        dataset = Dataset(
+            demos, h=4 * 8 + 1, device=device, obs_mode="rgb", obs_size=size
+        )
         video, abs_act, rel_act = dataset[0]
+
+        video = video[::4]
+
+        print(len(video), "frames")
 
         save_video(f"sample_{size}x{size}.mp4", video)
         # Convert video to the expected format for Wan: (B, C, T, H, W) normalized to [-1, 1]
@@ -600,7 +615,9 @@ def test_tokenizers():
             decoded = wan21_tokenizer.decode(encoded).sample
             t1 = time.time()
 
-            print(f"Wan2.1 tokens (T, H, W): {encoded.shape[2:]} (t={t1 - t0:.2f}s)")
+            print(
+                f"{size=} Wan2.1 tokens (T, H, W): {encoded.shape[2:]} (t={t1 - t0:.2f}s)"
+            )
 
         decoded = decoded[:1]
 
@@ -613,23 +630,72 @@ def test_tokenizers():
             decoded = wan22_tokenizer.decode(encoded).sample
             t1 = time.time()
 
-            print(f"Wan2.2 tokens (T, H, W): {encoded.shape[2:]} (t={t1 - t0:.2f}s)")
+            print(
+                f"{size=} Wan2.2 tokens (T, H, W): {encoded.shape[2:]} (t={t1 - t0:.2f}s)"
+            )
 
         decoded = decoded[:1]
 
         video_reconstructed = decoded.squeeze(0).permute(1, 2, 3, 0).cpu().numpy() + 1.0
         video_reconstructed = (video_reconstructed * 127.5).astype(np.uint8)
+
+        print("reconstructed video has shape", video_reconstructed.shape)
+
         save_video(f"reconstructed_wan2.2_{size}x{size}.mp4", video_reconstructed)
 
 
+# test_tokenizers()
 # Train video model.
-from diffusers import AutoencoderKLWan, WanTransformer3DModel
+# from diffusers import AutoencoderKLWan, WanTransformer3DModel
 
-wan21_tokenizer = AutoencoderKLWan.from_pretrained(
-    "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", subfolder="vae", low_cpu_mem_usage=True
-).to(device)
-wan21_1_3_b = WanTransformer3DModel.from_pretrained(
-    "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", subfolder="transformer", low_cpu_mem_usage=True
-).to(device)
+# wan21_tokenizer = AutoencoderKLWan.from_pretrained(
+#     "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", subfolder="vae", low_cpu_mem_usage=True
+# ).to(device)
+# wan21_1_3_b = WanTransformer3DModel.from_pretrained(
+#     "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", subfolder="transformer", low_cpu_mem_usage=True
+# ).to(device)
 
 # Sample from the model.
+
+
+def populate_sample_video_dir():
+    import os
+
+    if not os.path.exists("sample_dataset/videos"):
+        os.makedirs("sample_dataset/videos")
+
+    dataset = Dataset(
+        demos=load_demonstrations(),
+        h=8 * 16 + 2,
+        device=device,
+        obs_mode="rgb",
+        obs_size=128,
+    )
+    # shuffle indices
+    indices = torch.randperm(len(dataset)).tolist()
+
+    import pandas as pd
+
+    metadata_csv = {
+        "file_name": [],
+        "text": [],
+    }
+
+    default_caption = "A dot pushes a T block to a target position."
+
+    for i in range(100):
+        video, abs_act, rel_act = dataset[indices[i]]
+        # first frame looks stale for some reason.
+        video = video[1::8]
+        save_video(f"sample_dataset/videos/{i:04d}.mp4", video)
+        with open(f"sample_dataset/metas/{i:04d}.txt", "w") as f:
+            f.write(default_caption)
+
+        metadata_csv["file_name"].append(f"{i:04d}.mp4")
+        metadata_csv["text"].append(default_caption)
+
+    df = pd.DataFrame(metadata_csv)
+    df.to_csv("sample_dataset/metadata.csv", index=False)
+
+
+populate_sample_video_dir()
