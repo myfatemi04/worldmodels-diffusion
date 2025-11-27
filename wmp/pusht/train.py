@@ -1,6 +1,8 @@
 # pip install --root-user-action ignore accelerate diffusers av loguru matplotlib gymnasium gym-pusht "pymunk<7"; apt install -y libgl1-mesa-glx htop zip unzip
 
 # torchrun --nproc_per_node=1 --master_port=12341 -m scripts.train --config=train.py -- experiment=predict2_video2world_training_2b_pusht_128
+# or
+# python -m scripts.train --config=train.py -- experiment=predict2_video2world_training_2b_pusht_128
 
 import pickle
 
@@ -283,12 +285,12 @@ class StateObservationTransformer(nn.Module):
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def load_demonstrations():
-    states = torch.load("data/pusht_noise/train/states.pth")
-    with open("data/pusht_noise/train/seq_lengths.pkl", "rb") as f:
+def load_demonstrations(data_root="/root/data/pusht_noise/train/"):
+    states = torch.load(f"{data_root}/states.pth")
+    with open(f"{data_root}/seq_lengths.pkl", "rb") as f:
         seq_lengths = pickle.load(f)
-    abs_actions = torch.load("data/pusht_noise/train/abs_actions.pth")
-    rel_actions = torch.load("data/pusht_noise/train/rel_actions.pth")
+    abs_actions = torch.load(f"{data_root}/abs_actions.pth")
+    rel_actions = torch.load(f"{data_root}/rel_actions.pth")
 
     return [
         (
@@ -668,7 +670,7 @@ def populate_sample_video_dir():
 
     dataset = Dataset(
         demos=load_demonstrations(),
-        h=8 * 16 + 2,
+        h=8 * 17 + 2,
         device=device,
         obs_mode="rgb",
         obs_size=128,
@@ -814,12 +816,19 @@ from cosmos_predict2.config import MODEL_CHECKPOINTS, ModelKey
 DEFAULT_CHECKPOINT = MODEL_CHECKPOINTS[ModelKey(post_trained=False)]
 
 
-# GR1 dataset and dataloader
+# quirk of VideoDataset: must have at least num_frames + 1 frames in the video
 example_video_dataset = L(VideoDataset)(
-    dataset_dir="/root/sample_videos",
+    dataset_dir="/root/sample_dataset",
     num_frames=17,  # generate a bunch of videos
     video_size=(128, 128),
 )
+
+# example_video_dataset_2 = VideoDataset(
+#     dataset_dir="/root/sample_dataset",
+#     num_frames=17, # generate a bunch of videos
+#     video_size=(128, 128),
+# )
+# print(example_video_dataset_2[0])
 
 # Create DataLoader with distributed sampler
 dataloader_train = L(get_generic_dataloader)(
@@ -974,4 +983,5 @@ def make_config() -> Config:
     return c
 
 
-# populate_sample_video_dir()
+if __name__ == "__main__":
+    populate_sample_video_dir()
